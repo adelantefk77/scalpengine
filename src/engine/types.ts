@@ -181,7 +181,7 @@ export interface ActivePosition {
   unrealizedPnlPct: number;
 }
 
-export type ExitReason = 'TP_HIT' | 'SL_HIT' | 'TIME_STOP' | 'MANUAL_MARKET' | 'KILL_SWITCH';
+export type ExitReason = 'TP_HIT' | 'SL_HIT' | 'TIME_STOP' | 'MANUAL_MARKET' | 'KILL_SWITCH' | 'EXCHANGE_CLOSE';
 
 export interface ClosedTrade {
   id: string;

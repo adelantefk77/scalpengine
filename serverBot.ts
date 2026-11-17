@@ -2,10 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import {
   cancelBybitOrder,
+  fetchBybitClosedPnl,
   fetchBybitJson,
   fetchBybitPrivateAccount,
   fetchBybitPrivateState,
   getBybitEnvConfig,
+  getBybitNetworkDiagnostics,
   placeBybitOrder,
   triggerBybitKillSwitch,
 } from './serverBybit';
@@ -74,6 +76,7 @@ class ServerBotDaemon {
   private activePositions: ActivePosition[] = [];
   private pendingOrders: PendingOrder[] = [];
   private closedTrades: ClosedTrade[] = [];
+  private exchangeClosedTrades: ClosedTrade[] = [];
   private events: BotEvent[] = [];
 
   private privateAccount: PrivateAccountSnapshot = {
@@ -109,7 +112,9 @@ class ServerBotDaemon {
 
   private startedAt = Date.now();
   private lastMarketSyncAt: number | null = null;
+  private lastMarketError: string | null = null;
   private lastExchangeSyncAt = 0;
+  private lastClosedPnlSyncAt = 0;
   private isRefreshingKlines = false;
   private isEvaluatingTick = false;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -224,6 +229,8 @@ class ServerBotDaemon {
       const cfg = this.config;
       const basesToLoad = Array.from(new Set([...ALL_SCANNER_ASSETS, ...cfg.activePairs]));
       const batchSize = 6;
+      let loadedCount = 0;
+      let firstError: string | null = null;
 
       for (let i = 0; i < basesToLoad.length; i += batchSize) {
         const chunk = basesToLoad.slice(i, i + batchSize);
@@ -237,15 +244,23 @@ class ServerBotDaemon {
                 const parsed = parseBybitKlines(data.result.list);
                 if (parsed.length > 0) {
                   this.candlesByBase[base] = parsed;
+                  loadedCount++;
                 }
               }
-            } catch {
-              // ignore single-pair transient errors
+            } catch (err) {
+              if (!firstError) {
+                firstError = err instanceof Error ? err.message : 'Bybit market error';
+              }
             }
           })
         );
       }
-      this.lastMarketSyncAt = Date.now();
+      if (loadedCount > 0) {
+        this.lastMarketSyncAt = Date.now();
+        this.lastMarketError = null;
+      } else if (firstError) {
+        this.lastMarketError = firstError;
+      }
     } finally {
       this.isRefreshingKlines = false;
     }
@@ -323,8 +338,11 @@ class ServerBotDaemon {
       adxAtEntry: pos.adxAtEntry,
     };
 
-    this.closedTrades = [closed, ...this.closedTrades.slice(0, 499)];
-    if (this.executionMode === 'paper') {
+    if (this.executionMode === 'exchange') {
+      this.exchangeClosedTrades = [closed, ...this.exchangeClosedTrades.slice(0, 499)];
+      this.lastClosedPnlSyncAt = 0;
+    } else {
+      this.closedTrades = [closed, ...this.closedTrades.slice(0, 499)];
       this.paperEquity += netPnlUsd;
     }
 
@@ -361,7 +379,7 @@ class ServerBotDaemon {
     this.schedulePersist();
   }
 
-  public async syncExchangeState(): Promise<boolean> {
+  public async syncExchangeState(forceClosedPnl = false): Promise<boolean> {
     const envCfg = getBybitEnvConfig();
     if (!envCfg.configured) {
       this.privateAccount = {
@@ -469,11 +487,13 @@ class ServerBotDaemon {
       });
 
       // Detect positions closed directly on Bybit (e.g. TP/SL hit)
+      let positionDisappeared = false;
       for (const prevPos of this.activePositions) {
         const stillOpen = nextPositions.some(
           (np) => np.symbol === prevPos.symbol && np.side === prevPos.side
         );
         if (!stillOpen && !this.inFlightClosures.has(prevPos.id)) {
+          positionDisappeared = true;
           const { snapshot } = this.resolveSymbolDisplay(prevPos.symbol);
           const exitPrice = snapshot?.lastPrice ?? prevPos.markPrice;
           const tpDist = Math.abs(exitPrice - prevPos.tpPrice);
@@ -485,6 +505,85 @@ class ServerBotDaemon {
 
       this.pendingOrders = nextOrders;
       this.activePositions = nextPositions;
+
+      // Sync authoritative Bybit realized closed-pnl history every 20s or right after a position closes
+      if (
+        category === 'linear' &&
+        (forceClosedPnl || positionDisappeared || Date.now() - this.lastClosedPnlSyncAt >= 20000)
+      ) {
+        try {
+          const rawClosed = await fetchBybitClosedPnl(28);
+          this.lastClosedPnlSyncAt = Date.now();
+          const localHints = [...this.exchangeClosedTrades];
+
+          const mappedBybit: ClosedTrade[] = rawClosed.map((row) => {
+            const { base, displayPair } = this.resolveSymbolDisplay(row.symbol);
+            const side: 'LONG' | 'SHORT' = row.side === 'Sell' ? 'LONG' : 'SHORT';
+            const entryPrice = Number(row.avgEntryPrice || 0);
+            const exitPrice = Number(row.avgExitPrice || 0);
+            const qty = Number(row.closedSize || row.qty || 0);
+            const notionalUsd = Number(row.cumEntryValue || entryPrice * qty);
+            const leverage = Math.max(1, Number(row.leverage || cfg.leverage || 1));
+            const openFee = Math.abs(Number(row.openFee || 0));
+            const closeFee = Math.abs(Number(row.closeFee || 0));
+            const feesUsd = openFee + closeFee;
+            const netPnlUsd = Number(row.closedPnl || 0);
+            const grossPnlUsd = netPnlUsd + feesUsd;
+            const netPnlPct = notionalUsd > 0 ? (netPnlUsd / notionalUsd) * 100 : 0;
+            const openedAt = Number(row.createdTime || Date.now());
+            const closedAt = Number(row.updatedTime || Date.now());
+
+            const matchedLocal = localHints.find(
+              (lt) =>
+                lt.symbol === row.symbol &&
+                Math.abs(lt.closedAt - closedAt) <= 120_000
+            );
+
+            return {
+              id: `bybit-${row.orderId}-${row.updatedTime}`,
+              base,
+              symbol: row.symbol,
+              displayPair,
+              side,
+              entryPrice,
+              exitPrice,
+              notionalUsd,
+              qty,
+              leverage,
+              grossPnlUsd,
+              feesUsd,
+              netPnlUsd,
+              netPnlPct,
+              isMakerEntry: matchedLocal?.isMakerEntry ?? cfg.postOnly,
+              isMakerExit: matchedLocal?.isMakerExit ?? false,
+              exitReason: matchedLocal?.exitReason ?? 'EXCHANGE_CLOSE',
+              openedAt,
+              closedAt,
+              durationSec: Math.max(1, Math.round((closedAt - openedAt) / 1000)),
+              zScoreAtEntry: matchedLocal?.zScoreAtEntry ?? 0,
+              rsiAtEntry: matchedLocal?.rsiAtEntry ?? 50,
+              adxAtEntry: matchedLocal?.adxAtEntry ?? 20,
+            };
+          });
+
+          // Retain very recent local records (<45s) if Bybit closed-pnl hasn't indexed them yet
+          const recentUnmatched = localHints.filter(
+            (lt) =>
+              !lt.id.startsWith('bybit-') &&
+              Date.now() - lt.closedAt < 45_000 &&
+              !mappedBybit.some(
+                (bt) => bt.symbol === lt.symbol && Math.abs(bt.closedAt - lt.closedAt) <= 120_000
+              )
+          );
+
+          this.exchangeClosedTrades = [...recentUnmatched, ...mappedBybit]
+            .sort((a, b) => b.closedAt - a.closedAt)
+            .slice(0, 500);
+        } catch {
+          // keep cached exchangeClosedTrades on transient closed-pnl API error
+        }
+      }
+
       return true;
     } catch (err) {
       this.privateAccount = {
@@ -1213,11 +1312,15 @@ class ServerBotDaemon {
     return !exists;
   }
 
+  private getActiveClosedTrades(): ClosedTrade[] {
+    return this.executionMode === 'exchange' ? this.exchangeClosedTrades : this.closedTrades;
+  }
+
   private getTodayRealizedPnl(): number {
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
     const ts = startOfDay.getTime();
-    return this.closedTrades
+    return this.getActiveClosedTrades()
       .filter((t) => t.closedAt >= ts)
       .reduce((acc, t) => acc + t.netPnlUsd, 0);
   }
@@ -1264,6 +1367,8 @@ class ServerBotDaemon {
       serverDaemon: true,
       startedAt: this.startedAt,
       lastMarketSyncAt: this.lastMarketSyncAt,
+      marketError: this.lastMarketError,
+      networkDiagnostics: getBybitNetworkDiagnostics(),
       botState: this.botState,
       executionMode: this.executionMode,
       config: this.config,
@@ -1279,7 +1384,7 @@ class ServerBotDaemon {
       drawdownPct: this.getDrawdownPct(),
       activePositions: this.activePositions,
       pendingOrders: this.pendingOrders,
-      closedTrades: this.closedTrades,
+      closedTrades: this.getActiveClosedTrades(),
       events: this.events,
       privateStatus,
       privateAccount: this.privateAccount,

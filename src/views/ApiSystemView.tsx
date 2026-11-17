@@ -25,6 +25,8 @@ export const ApiSystemView: React.FC = () => {
     privateAccount,
     serverStartedAt,
     serverLastMarketSyncAt,
+    serverMarketError,
+    networkDiagnostics,
     refreshPrivateAccount,
     refreshMarketData,
     resetPaperAccount,
@@ -237,7 +239,9 @@ export const ApiSystemView: React.FC = () => {
             <pre className="p-2.5 rounded bg-surface-container font-mono text-[11px] text-tertiary overflow-x-auto leading-relaxed border border-white/5">
 {`BYBIT_ENV="demo"
 BYBIT_API_KEY="TWOJ_KLUCZ_DEMO_Z_BYBIT"
-BYBIT_API_SECRET="TWOJ_SEKRET_DEMO_Z_BYBIT"`}
+BYBIT_API_SECRET="TWOJ_SEKRET_DEMO_Z_BYBIT"
+# Opcjonalnie przy błędzie HTTP 403 na Railway:
+BYBIT_PROXY_URL="http://user:pass@proxy-host:port"`}
             </pre>
           </div>
         </div>
@@ -267,19 +271,37 @@ BYBIT_API_SECRET="TWOJ_SEKRET_DEMO_Z_BYBIT"`}
         <div className="bg-surface-container-low p-4 rounded-xl border border-white/5 flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="font-mono text-[10px] uppercase text-on-surface-variant">Autonomiczny Silnik 24/7 (Server)</span>
-            <Server className="w-4 h-4 text-tertiary" />
+            <Server className={`w-4 h-4 ${serverMarketError ? 'text-error' : 'text-tertiary'}`} />
           </div>
           <div className="font-mono text-base font-bold text-on-surface">
-            {healthInfo ? (healthInfo.ok ? 'Daemon 24/7 + Bybit OK' : 'Błąd REST') : 'Daemon 24/7 Aktywny'}
+            {serverMarketError
+              ? 'Błąd sieci Bybit (Serwer)'
+              : healthInfo
+                ? healthInfo.ok
+                  ? 'Daemon 24/7 + Bybit OK'
+                  : 'Błąd REST'
+                : 'Daemon 24/7 Aktywny'}
           </div>
           <div className="font-mono text-[11px] text-on-surface-variant">
-            Działa w tle na serwerze również po zamknięciu przeglądarki
+            {serverMarketError ? (
+              <span className="text-error break-words">{serverMarketError}</span>
+            ) : (
+              'Działa w tle na serwerze również po zamknięciu przeglądarki'
+            )}
           </div>
           <div className="flex justify-between font-mono text-[11px] pt-1 border-t border-white/5 tabular-nums">
             <span className="text-on-surface-variant">Start / Sync świec:</span>
             <span className="text-on-surface">
               {serverStartedAt ? formatTimeHms(serverStartedAt) : '—'} /{' '}
               {serverLastMarketSyncAt ? formatTimeHms(serverLastMarketSyncAt) : '—'}
+            </span>
+          </div>
+          <div className="flex justify-between font-mono text-[11px]">
+            <span className="text-on-surface-variant">Region / Proxy / Host:</span>
+            <span className="text-on-surface truncate max-w-[60%] text-right">
+              {networkDiagnostics?.railwayRegion || 'local'} ·{' '}
+              {networkDiagnostics?.proxyConfigured ? 'Proxy ON' : 'Direct'} ·{' '}
+              {networkDiagnostics?.activePublicHost?.replace('https://', '') || '—'}
             </span>
           </div>
           <div className="flex justify-between font-mono text-[11px]">

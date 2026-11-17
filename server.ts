@@ -9,6 +9,7 @@ import {
   fetchBybitPrivateAccount,
   fetchBybitPrivateState,
   getBybitEnvConfig,
+  getBybitNetworkDiagnostics,
   placeBybitOrder,
   triggerBybitKillSwitch,
   type PrivateOrderPayload,
@@ -27,13 +28,14 @@ async function startServer() {
 
   // Public health endpoint
   app.get('/api/health', async (_req, res) => {
+    const netDiag = getBybitNetworkDiagnostics();
+    const envCfg = getBybitEnvConfig();
     try {
       const start = Date.now();
       const result = await fetchBybitJson<{ result?: { timeSecond?: string; timeNano?: string } }>(
         '/v5/market/time',
         1000
       );
-      const envCfg = getBybitEnvConfig();
       res.json({
         ok: true,
         serverTimeMs: Date.now(),
@@ -43,10 +45,15 @@ async function startServer() {
         privateEnv: envCfg.env,
         privateConfigured: envCfg.configured,
         serverDaemon: true,
+        networkDiagnostics: { ...netDiag, activePublicHost: result.host },
       });
     } catch (err) {
       res.status(502).json({
         ok: false,
+        privateEnv: envCfg.env,
+        privateConfigured: envCfg.configured,
+        serverDaemon: true,
+        networkDiagnostics: netDiag,
         error: err instanceof Error ? err.message : 'Bybit unreachable',
       });
     }
@@ -126,7 +133,7 @@ async function startServer() {
         return;
       }
       case 'refresh_private': {
-        const synced = await serverBot.syncExchangeState();
+        const synced = await serverBot.syncExchangeState(true);
         res.json({ ok: synced, ...serverBot.getSnapshot() });
         return;
       }

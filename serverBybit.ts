@@ -1,6 +1,10 @@
 import crypto from 'crypto';
+import { ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
 export const PUBLIC_BYBIT_HOSTS = ['https://api.bybit.com', 'https://api.bytick.com'];
+
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 export type BybitEnv = 'demo' | 'testnet' | 'mainnet';
 
@@ -11,6 +15,13 @@ export interface BybitEnvConfig {
   apiSecret: string;
   configured: boolean;
   keyMask: string | null;
+}
+
+export interface BybitNetworkDiagnostics {
+  proxyConfigured: boolean;
+  railwayRegion: string | null;
+  activePublicHost: string | null;
+  blockedHosts: string[];
 }
 
 export function getBybitEnvConfig(): BybitEnvConfig {
@@ -40,6 +51,88 @@ export function getBybitEnvConfig(): BybitEnvConfig {
   };
 }
 
+let cachedProxyUrl = '';
+let cachedProxyAgent: Dispatcher | undefined;
+
+function getProxyDispatcher(): Dispatcher | undefined {
+  const proxyUrl = (
+    process.env.BYBIT_PROXY_URL ||
+    process.env.HTTPS_PROXY ||
+    process.env.HTTP_PROXY ||
+    ''
+  ).trim();
+
+  if (!proxyUrl) {
+    cachedProxyUrl = '';
+    cachedProxyAgent = undefined;
+    return undefined;
+  }
+
+  if (proxyUrl !== cachedProxyUrl || !cachedProxyAgent) {
+    cachedProxyUrl = proxyUrl;
+    cachedProxyAgent = new ProxyAgent(proxyUrl);
+  }
+  return cachedProxyAgent;
+}
+
+const hostCooldownUntil = new Map<string, number>();
+let lastWorkingPublicHost: string | null = null;
+
+function getPublicBybitHosts(): string[] {
+  const envCfg = getBybitEnvConfig();
+  const customHost = (process.env.BYBIT_PUBLIC_HOST || '').trim().replace(/\/+$/, '');
+  const baseHosts: string[] = [];
+
+  if (customHost) baseHosts.push(customHost);
+  if (envCfg.env === 'testnet') {
+    baseHosts.push('https://api-testnet.bybit.com', 'https://api.bybit.com', 'https://api.bytick.com');
+  } else if (envCfg.env === 'demo') {
+    baseHosts.push('https://api.bybit.com', 'https://api.bytick.com', 'https://api-demo.bybit.com');
+  } else {
+    baseHosts.push('https://api.bybit.com', 'https://api.bytick.com');
+  }
+
+  const unique = Array.from(new Set(baseHosts));
+  const now = Date.now();
+  const healthy = unique.filter((h) => (hostCooldownUntil.get(h) || 0) <= now);
+  const cooled = unique.filter((h) => (hostCooldownUntil.get(h) || 0) > now);
+
+  if (lastWorkingPublicHost && healthy.includes(lastWorkingPublicHost)) {
+    return [
+      lastWorkingPublicHost,
+      ...healthy.filter((h) => h !== lastWorkingPublicHost),
+      ...cooled,
+    ];
+  }
+  return [...healthy, ...cooled];
+}
+
+export function getBybitNetworkDiagnostics(): BybitNetworkDiagnostics {
+  const now = Date.now();
+  const blockedHosts = Array.from(hostCooldownUntil.entries())
+    .filter(([, until]) => until > now)
+    .map(([host]) => host);
+
+  return {
+    proxyConfigured: Boolean(getProxyDispatcher()),
+    railwayRegion:
+      process.env.RAILWAY_REGION || process.env.RAILWAY_REPLICA_REGION || null,
+    activePublicHost: lastWorkingPublicHost,
+    blockedHosts,
+  };
+}
+
+function formatBybitHttpError(status: number, host: string, rawText: string): string {
+  const lower = rawText.toLowerCase();
+  if (status === 403 || lower.includes('cloudfront') || lower.includes('access denied')) {
+    const region = process.env.RAILWAY_REGION || process.env.RAILWAY_REPLICA_REGION;
+    const regionHint = region ? ` [region: ${region}]` : '';
+    return `HTTP 403 z ${host}${regionHint} — blokada CloudFront/geo-IP (w Railway przełącz Deploy Region na EU West / Singapore lub ustaw BYBIT_PROXY_URL).`;
+  }
+  const cleanSnippet = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+  return cleanSnippet ? `HTTP ${status} from ${host}: ${cleanSnippet}` : `HTTP ${status} from ${host}`;
+}
+
 interface CacheEntry<T> {
   data: T;
   expiresAt: number;
@@ -57,33 +150,53 @@ export async function fetchBybitJson<T>(
     return { data: cached.data as T, latencyMs: 1, host: 'cache' };
   }
 
+  const hosts = getPublicBybitHosts();
+  const dispatcher = getProxyDispatcher();
   let lastError: unknown = null;
-  for (const host of PUBLIC_BYBIT_HOSTS) {
+
+  for (const host of hosts) {
     const start = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(`${host}${endpointPath}`, {
+      const res = await undiciFetch(`${host}${endpointPath}`, {
         signal: controller.signal,
+        dispatcher,
         headers: {
           Accept: 'application/json',
-          'User-Agent': 'ScalpEngine/1.0',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'User-Agent': BROWSER_USER_AGENT,
         },
       });
-      clearTimeout(timeout);
+      const rawText = await res.text();
 
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status} from ${host}`);
+        if (res.status === 403 || res.status >= 500) {
+          hostCooldownUntil.set(host, Date.now() + 60000);
+        }
+        throw new Error(formatBybitHttpError(res.status, host, rawText));
       }
-      const json = (await res.json()) as { retCode?: number; retMsg?: string } & T;
+
+      let json: { retCode?: number; retMsg?: string } & T;
+      try {
+        json = JSON.parse(rawText) as { retCode?: number; retMsg?: string } & T;
+      } catch {
+        throw new Error(`Nieprawidłowa odpowiedź JSON z ${host}`);
+      }
+
       if (typeof json.retCode === 'number' && json.retCode !== 0) {
         throw new Error(`Bybit retCode ${json.retCode}: ${json.retMsg || 'Unknown error'}`);
       }
+
+      hostCooldownUntil.delete(host);
+      lastWorkingPublicHost = host;
       const latencyMs = Date.now() - start;
       cache.set(endpointPath, { data: json, expiresAt: Date.now() + cacheTtlMs });
       return { data: json as T, latencyMs, host };
     } catch (err) {
       lastError = err;
+    } finally {
+      clearTimeout(timeout);
     }
   }
   throw lastError instanceof Error ? lastError : new Error('Failed to fetch from Bybit API');
@@ -100,7 +213,7 @@ export async function signedBybitRequest<T>(
   }
 
   const timestamp = Date.now().toString();
-  const recvWindow = '5000';
+  const recvWindow = (process.env.BYBIT_RECV_WINDOW || '5000').trim() || '5000';
 
   let queryString = '';
   let bodyString = '';
@@ -124,33 +237,55 @@ export async function signedBybitRequest<T>(
     .digest('hex');
 
   const url = `${cfg.privateBaseUrl}${apiPath}${queryString ? `?${queryString}` : ''}`;
+  const dispatcher = getProxyDispatcher();
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
-  const res = await fetch(url, {
-    method,
-    signal: controller.signal,
-    headers: {
-      'X-BAPI-API-KEY': cfg.apiKey,
-      'X-BAPI-SIGN': signature,
-      'X-BAPI-SIGN-TYPE': '2',
-      'X-BAPI-TIMESTAMP': timestamp,
-      'X-BAPI-RECV-WINDOW': recvWindow,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: method === 'POST' ? bodyString : undefined,
-  });
-  clearTimeout(timeout);
+  try {
+    const res = await undiciFetch(url, {
+      method,
+      signal: controller.signal,
+      dispatcher,
+      headers: {
+        'X-BAPI-API-KEY': cfg.apiKey,
+        'X-BAPI-SIGN': signature,
+        'X-BAPI-SIGN-TYPE': '2',
+        'X-BAPI-TIMESTAMP': timestamp,
+        'X-BAPI-RECV-WINDOW': recvWindow,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': BROWSER_USER_AGENT,
+      },
+      body: method === 'POST' ? bodyString : undefined,
+    });
 
-  const json = (await res.json()) as { retCode?: number; retMsg?: string; result?: T };
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${json.retMsg || 'Bybit error'}`);
+    const rawText = await res.text();
+    let json: { retCode?: number; retMsg?: string; result?: T } | null = null;
+    try {
+      json = JSON.parse(rawText) as { retCode?: number; retMsg?: string; result?: T };
+    } catch {
+      json = null;
+    }
+
+    if (!res.ok) {
+      if (json?.retMsg) {
+        throw new Error(`HTTP ${res.status}: ${json.retMsg}`);
+      }
+      throw new Error(formatBybitHttpError(res.status, cfg.privateBaseUrl, rawText));
+    }
+
+    if (!json) {
+      throw new Error(`Nieprawidłowa odpowiedź z ${cfg.privateBaseUrl}`);
+    }
+
+    if (typeof json.retCode === 'number' && json.retCode !== 0) {
+      throw new Error(`Bybit [${json.retCode}]: ${json.retMsg || 'Unknown error'}`);
+    }
+    return json as unknown as T;
+  } finally {
+    clearTimeout(timeout);
   }
-  if (typeof json.retCode === 'number' && json.retCode !== 0) {
-    throw new Error(`Bybit [${json.retCode}]: ${json.retMsg || 'Unknown error'}`);
-  }
-  return json as unknown as T;
 }
 
 export interface InstrumentFilters {
@@ -518,3 +653,69 @@ export async function triggerBybitKillSwitch(): Promise<{
 
   return { cancelled, closed };
 }
+
+export interface RawBybitClosedPnl {
+  symbol: string;
+  orderId: string;
+  side: string; // closing order side: Sell = closed LONG, Buy = closed SHORT
+  qty: string;
+  orderPrice: string;
+  orderType: string;
+  execType: string;
+  closedSize: string;
+  cumEntryValue: string;
+  avgEntryPrice: string;
+  cumExitValue: string;
+  avgExitPrice: string;
+  closedPnl: string;
+  fillCount: string;
+  leverage: string;
+  openFee?: string;
+  closeFee?: string;
+  createdTime: string;
+  updatedTime: string;
+}
+
+export async function fetchBybitClosedPnl(days = 28): Promise<RawBybitClosedPnl[]> {
+  const now = Date.now();
+  const weekMs = 7 * 24 * 60 * 60 * 1000 - 60_000;
+  const weeks = Math.max(1, Math.min(8, Math.ceil(days / 7)));
+
+  const windows: Array<{ startTime: number; endTime: number }> = [];
+  for (let w = 0; w < weeks; w++) {
+    const endTime = now - w * weekMs;
+    const startTime = endTime - weekMs;
+    windows.push({ startTime, endTime });
+  }
+
+  const results = await Promise.allSettled(
+    windows.map((win) =>
+      signedBybitRequest<{ result?: { list?: RawBybitClosedPnl[] } }>(
+        'GET',
+        '/v5/position/closed-pnl',
+        {
+          category: 'linear',
+          startTime: win.startTime,
+          endTime: win.endTime,
+          limit: 100,
+        }
+      )
+    )
+  );
+
+  const byId = new Map<string, RawBybitClosedPnl>();
+  for (const res of results) {
+    if (res.status !== 'fulfilled') continue;
+    for (const row of res.value.result?.list ?? []) {
+      const key = `${row.orderId}-${row.updatedTime}`;
+      if (!byId.has(key)) {
+        byId.set(key, row);
+      }
+    }
+  }
+
+  return Array.from(byId.values()).sort(
+    (a, b) => Number(b.updatedTime || 0) - Number(a.updatedTime || 0)
+  );
+}
+

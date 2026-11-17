@@ -1,17 +1,138 @@
 import React, { useMemo, useState } from 'react';
-import { Download, Filter, LineChart, Search, Trash2 } from 'lucide-react';
+import { CalendarDays, ChevronLeft, ChevronRight, Download, Filter, LineChart, Search, Trash2, X } from 'lucide-react';
 import { useBot } from '../engine/botContext';
 import { downloadCsv, formatPrice, formatShortDateTime, formatUsd } from '../engine/format';
 
+function toLocalDateKey(ts: number): string {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function formatCompactTilePnl(value: number): string {
+  const normalized = Math.abs(value) < 0.005 ? 0 : value;
+  const sign = normalized > 0 ? '+' : normalized < 0 ? '-' : '';
+  const abs = Math.abs(normalized);
+  if (abs >= 10000) return `${sign}$${(abs / 1000).toFixed(1)}k`;
+  if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(2)}k`;
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
+const WEEKDAY_LABELS = ['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'Sb', 'Nd'];
+
 export const HistoryView: React.FC = () => {
-  const { closedTrades, resetPaperAccount, setActiveRoute, showToast } = useBot();
+  const { closedTrades, executionMode, resetPaperAccount, refreshPrivateAccount, setActiveRoute, showToast } = useBot();
   const [sideFilter, setSideFilter] = useState<'ALL' | 'LONG' | 'SHORT'>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<'ALL' | 'WIN' | 'LOSS'>('ALL');
+  const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+
+  const [calendarMonth, setCalendarMonth] = useState<{ year: number; month: number }>(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
+
+  const dailyStatsMap = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        pnl: number;
+        trades: number;
+        wins: number;
+      }
+    >();
+
+    for (const t of closedTrades) {
+      const key = toLocalDateKey(t.closedAt);
+      const cur = map.get(key) || { pnl: 0, trades: 0, wins: 0 };
+      cur.pnl += t.netPnlUsd;
+      cur.trades += 1;
+      if (t.netPnlUsd > 0) cur.wins += 1;
+      map.set(key, cur);
+    }
+    return map;
+  }, [closedTrades]);
+
+  const calendarData = useMemo(() => {
+    const { year, month } = calendarMonth;
+    const firstOfMonth = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    // Convert JS getDay() (0=Sun..6=Sat) to Monday-first offset (0=Mon..6=Sun)
+    const startOffset = (firstOfMonth.getDay() + 6) % 7;
+    const todayKey = toLocalDateKey(Date.now());
+
+    const cells: Array<
+      | { empty: true; key: string }
+      | {
+          empty: false;
+          key: string;
+          dayNum: number;
+          isToday: boolean;
+          stats: { pnl: number; trades: number; wins: number } | null;
+        }
+    > = [];
+
+    for (let i = 0; i < startOffset; i++) {
+      cells.push({ empty: true, key: `empty-start-${i}` });
+    }
+
+    let monthPnl = 0;
+    let monthTrades = 0;
+    let greenDays = 0;
+    let redDays = 0;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateKey = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const stats = dailyStatsMap.get(dateKey) ?? null;
+      if (stats) {
+        monthPnl += stats.pnl;
+        monthTrades += stats.trades;
+        if (stats.pnl > 0) greenDays += 1;
+        else if (stats.pnl < 0) redDays += 1;
+      }
+      cells.push({
+        empty: false,
+        key: dateKey,
+        dayNum: d,
+        isToday: dateKey === todayKey,
+        stats,
+      });
+    }
+
+    const monthLabelRaw = firstOfMonth.toLocaleDateString('pl-PL', {
+      month: 'long',
+      year: 'numeric',
+    });
+    const monthLabel = monthLabelRaw.charAt(0).toUpperCase() + monthLabelRaw.slice(1);
+
+    return {
+      cells,
+      monthLabel,
+      monthPnl,
+      monthTrades,
+      greenDays,
+      redDays,
+    };
+  }, [calendarMonth, dailyStatsMap]);
+
+  const shiftMonth = (delta: number) => {
+    setCalendarMonth((prev) => {
+      const d = new Date(prev.year, prev.month + delta, 1);
+      return { year: d.getFullYear(), month: d.getMonth() };
+    });
+  };
+
+  const resetToCurrentMonth = () => {
+    const now = new Date();
+    setCalendarMonth({ year: now.getFullYear(), month: now.getMonth() });
+  };
 
   const filtered = useMemo(() => {
     const q = query.trim().toUpperCase();
     return closedTrades.filter((t) => {
+      if (selectedDayKey && toLocalDateKey(t.closedAt) !== selectedDayKey) return false;
       if (sideFilter !== 'ALL' && t.side !== sideFilter) return false;
       if (outcomeFilter === 'WIN' && t.netPnlUsd <= 0) return false;
       if (outcomeFilter === 'LOSS' && t.netPnlUsd > 0) return false;
@@ -20,7 +141,7 @@ export const HistoryView: React.FC = () => {
       }
       return true;
     });
-  }, [closedTrades, sideFilter, outcomeFilter, query]);
+  }, [closedTrades, selectedDayKey, sideFilter, outcomeFilter, query]);
 
   const analytics = useMemo(() => {
     const total = closedTrades.length;
@@ -115,14 +236,25 @@ export const HistoryView: React.FC = () => {
             <Download className="w-3.5 h-3.5" />
             <span>Eksport CSV</span>
           </button>
-          <button
-            type="button"
-            onClick={resetPaperAccount}
-            className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-error-container hover:text-on-error-container text-on-surface-variant text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Wyczyść i Resetuj ($25k)</span>
-          </button>
+          {executionMode === 'exchange' ? (
+            <button
+              type="button"
+              onClick={() => void refreshPrivateAccount()}
+              className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-tertiary text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              <CalendarDays className="w-3.5 h-3.5" />
+              <span>Synchronizuj z Bybit</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={resetPaperAccount}
+              className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-error-container hover:text-on-error-container text-on-surface-variant text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Wyczyść i Resetuj ($25k)</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -159,6 +291,161 @@ export const HistoryView: React.FC = () => {
           <div className="font-mono text-xl font-bold text-on-surface mt-1 tabular-nums">
             {analytics.total > 0 ? `${analytics.avgDurationMin.toFixed(1)} min` : '—'}
           </div>
+        </div>
+      </div>
+
+      {/* Monthly PnL Calendar */}
+      <div className="bg-surface-container-low p-4 rounded-xl border border-white/5 flex flex-col gap-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <CalendarDays className="w-4 h-4 text-primary" />
+            <div>
+              <h2 className="font-display text-sm font-bold text-on-surface">Kalendarz Dziennego PnL</h2>
+              <p className="text-[11px] text-on-surface-variant">
+                Zielone i czerwone kafelki pokazują wynik netto z każdego dnia. Kliknij dzień, aby przefiltrować listę poniżej.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-3 bg-surface-container-lowest px-3 py-1.5 rounded-lg border border-white/5 font-mono text-xs tabular-nums">
+              <div>
+                <span className="text-on-surface-variant mr-1.5">Miesiąc:</span>
+                <span
+                  className={`font-bold ${
+                    calendarData.monthPnl > 0
+                      ? 'text-tertiary'
+                      : calendarData.monthPnl < 0
+                        ? 'text-error'
+                        : 'text-on-surface'
+                  }`}
+                >
+                  {formatUsd(calendarData.monthPnl, true)}
+                </span>
+              </div>
+              <span className="text-white/10">|</span>
+              <div>
+                <span className="text-tertiary font-bold">{calendarData.greenDays}</span>
+                <span className="text-on-surface-variant mx-1">/</span>
+                <span className="text-error font-bold">{calendarData.redDays}</span>
+                <span className="text-on-surface-variant ml-1 text-[10px]">dni (+ / -)</span>
+              </div>
+              <span className="text-white/10 hidden sm:inline">|</span>
+              <div className="hidden sm:block text-on-surface-variant">
+                <span className="text-on-surface font-bold">{calendarData.monthTrades}</span> zagrań
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1 bg-surface-container-lowest p-1 rounded-lg border border-white/5">
+              <button
+                type="button"
+                onClick={() => shiftMonth(-1)}
+                aria-label="Poprzedni miesiąc"
+                className="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={resetToCurrentMonth}
+                className="px-2.5 py-1 rounded hover:bg-surface-container-high font-mono text-xs font-bold text-on-surface min-w-[130px] text-center transition-colors"
+              >
+                {calendarData.monthLabel}
+              </button>
+              <button
+                type="button"
+                onClick={() => shiftMonth(1)}
+                aria-label="Następny miesiąc"
+                className="p-1.5 rounded hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface transition-colors"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Weekday Headers */}
+        <div className="grid grid-cols-7 gap-1.5 sm:gap-2">
+          {WEEKDAY_LABELS.map((label) => (
+            <div
+              key={label}
+              className="text-center font-mono text-[10px] uppercase tracking-wider text-on-surface-variant py-1"
+            >
+              {label}
+            </div>
+          ))}
+
+          {/* Calendar Tiles */}
+          {calendarData.cells.map((cell) => {
+            if (cell.empty) {
+              return <div key={cell.key} className="min-h-[68px] sm:min-h-[78px] rounded-lg bg-surface-container-lowest/20" />;
+            }
+
+            const { key, dayNum, isToday, stats } = cell;
+            const hasTrades = Boolean(stats && stats.trades > 0);
+            const pnl = stats?.pnl ?? 0;
+            const isWinDay = hasTrades && pnl > 0.004;
+            const isLossDay = hasTrades && pnl < -0.004;
+            const isSelected = selectedDayKey === key;
+
+            let tileStyle = 'bg-surface-container-lowest/70 border-white/5 text-on-surface-variant';
+            if (isWinDay) {
+              tileStyle =
+                'bg-tertiary-container/20 border-tertiary/40 hover:bg-tertiary-container/30 text-on-surface';
+            } else if (isLossDay) {
+              tileStyle =
+                'bg-error-container/25 border-error/40 hover:bg-error-container/35 text-on-surface';
+            } else if (hasTrades) {
+              tileStyle = 'bg-surface-container-high border-white/15 text-on-surface';
+            }
+
+            return (
+              <button
+                key={key}
+                type="button"
+                disabled={!hasTrades}
+                onClick={() => setSelectedDayKey((prev) => (prev === key ? null : key))}
+                title={
+                  stats
+                    ? `${key}: ${formatUsd(stats.pnl, true)} (${stats.trades} transakcji, WR ${((stats.wins / stats.trades) * 100).toFixed(0)}%)`
+                    : `${key}: brak zamkniętych transakcji`
+                }
+                className={`min-h-[68px] sm:min-h-[78px] p-1.5 sm:p-2 rounded-lg border text-left flex flex-col justify-between transition-all ${tileStyle} ${
+                  isSelected ? 'ring-2 ring-primary border-primary' : ''
+                } ${isToday && !isSelected ? 'ring-1 ring-primary/50' : ''} ${
+                  hasTrades ? 'cursor-pointer' : 'cursor-default opacity-75'
+                }`}
+              >
+                <div className="flex items-center justify-between w-full">
+                  <span
+                    className={`font-mono text-[11px] font-bold tabular-nums ${
+                      isToday ? 'text-primary' : hasTrades ? 'text-on-surface' : 'text-on-surface-variant'
+                    }`}
+                  >
+                    {dayNum}
+                  </span>
+                  {isToday && <span className="w-1.5 h-1.5 rounded-full bg-primary" />}
+                </div>
+
+                {hasTrades && stats ? (
+                  <div className="flex flex-col gap-0.5 mt-1">
+                    <div
+                      className={`font-mono text-[11px] sm:text-xs font-bold tabular-nums leading-tight truncate ${
+                        pnl > 0 ? 'text-tertiary' : pnl < 0 ? 'text-error' : 'text-on-surface'
+                      }`}
+                    >
+                      {formatCompactTilePnl(pnl)}
+                    </div>
+                    <div className="font-mono text-[9px] sm:text-[10px] text-on-surface-variant tabular-nums truncate">
+                      {stats.trades}x · {((stats.wins / stats.trades) * 100).toFixed(0)}%
+                    </div>
+                  </div>
+                ) : (
+                  <div className="font-mono text-[10px] text-on-surface-variant/40 mt-auto">—</div>
+                )}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -237,6 +524,23 @@ export const HistoryView: React.FC = () => {
                 </button>
               ))}
             </div>
+
+            {selectedDayKey && (() => {
+              const dayInfo = dailyStatsMap.get(selectedDayKey);
+              return (
+                <button
+                  type="button"
+                  onClick={() => setSelectedDayKey(null)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-primary-container/20 border border-primary/40 text-primary font-mono text-[11px] font-bold hover:bg-primary-container/30 transition-colors"
+                >
+                  <span>
+                    Dzień: {selectedDayKey}
+                    {dayInfo ? ` (${dayInfo.trades}x · ${formatUsd(dayInfo.pnl, true)})` : ''}
+                  </span>
+                  <X className="w-3 h-3" />
+                </button>
+              );
+            })()}
           </div>
 
           <div className="relative flex items-center">

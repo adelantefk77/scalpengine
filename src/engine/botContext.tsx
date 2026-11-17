@@ -37,6 +37,13 @@ interface WsStatusState {
   error: string | null;
 }
 
+interface NetworkDiagnostics {
+  proxyConfigured: boolean;
+  railwayRegion: string | null;
+  activePublicHost: string | null;
+  blockedHosts: string[];
+}
+
 interface DaemonSnapshotResponse {
   ok?: boolean;
   error?: string;
@@ -44,6 +51,8 @@ interface DaemonSnapshotResponse {
   serverDaemon?: boolean;
   startedAt?: number;
   lastMarketSyncAt?: number | null;
+  marketError?: string | null;
+  networkDiagnostics?: NetworkDiagnostics;
   botState: BotRunState;
   executionMode: ExecutionMode;
   config: StrategyConfig;
@@ -74,6 +83,8 @@ interface BotContextValue {
   privateAccount: PrivateAccountSnapshot;
   serverStartedAt: number | null;
   serverLastMarketSyncAt: number | null;
+  serverMarketError: string | null;
+  networkDiagnostics: NetworkDiagnostics | null;
   refreshPrivateAccount: () => Promise<boolean>;
   togglePauseBot: () => void;
   resumeFromKillSwitch: () => void;
@@ -130,6 +141,8 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   });
   const [serverStartedAt, setServerStartedAt] = useState<number | null>(null);
   const [serverLastMarketSyncAt, setServerLastMarketSyncAt] = useState<number | null>(null);
+  const [serverMarketError, setServerMarketError] = useState<string | null>(null);
+  const [networkDiagnostics, setNetworkDiagnostics] = useState<NetworkDiagnostics | null>(null);
 
   const [equity, setEquity] = useState<number>(DEFAULT_START_EQUITY);
   const [startingEquity, setStartingEquity] = useState<number>(DEFAULT_START_EQUITY);
@@ -176,6 +189,8 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!data || !data.config) return;
     if (data.startedAt) setServerStartedAt(data.startedAt);
     if (data.lastMarketSyncAt !== undefined) setServerLastMarketSyncAt(data.lastMarketSyncAt);
+    if (data.marketError !== undefined) setServerMarketError(data.marketError);
+    if (data.networkDiagnostics) setNetworkDiagnostics(data.networkDiagnostics);
     setBotState(data.botState);
     setExecutionModeState(data.executionMode);
     setConfig(data.config);
@@ -216,20 +231,47 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => window.clearInterval(timer);
   }, [syncDaemonState]);
 
-  // Fetch public tickers + klines for live chart & scanner UI
+  // Fetch public tickers + klines for live chart & scanner UI (with direct browser fallback if server IP is geo-blocked)
   const refreshMarketData = useCallback(async () => {
     const cfg = configRef.current;
     const category = resolveBybitCategory(cfg.marketType);
     const basesToLoad = Array.from(new Set([...ALL_SCANNER_ASSETS, ...cfg.activePairs]));
+    const directHosts = ['https://api.bybit.com', 'https://api.bytick.com'];
+
+    const fetchPublicMarketJson = async (apiEndpoint: string, directPath: string) => {
+      try {
+        const res = await fetch(apiEndpoint);
+        const json = await res.json();
+        if (res.ok && json.retCode === 0) {
+          return { json, usedBrowserFallback: false, serverError: null as string | null };
+        }
+        const errMsg = json.retMsg || `HTTP ${res.status}`;
+        // Fallback directly from user's browser if server IP is blocked by Bybit CloudFront
+        for (const host of directHosts) {
+          try {
+            const directRes = await fetch(`${host}${directPath}`);
+            const directJson = await directRes.json();
+            if (directRes.ok && directJson.retCode === 0) {
+              return { json: directJson, usedBrowserFallback: true, serverError: errMsg };
+            }
+          } catch {
+            // try next host
+          }
+        }
+        throw new Error(errMsg);
+      } catch (err) {
+        if (err instanceof Error) throw err;
+        throw new Error('Błąd pobierania danych rynkowych z Bybit API');
+      }
+    };
 
     try {
       const tStart = performance.now();
-      const tickersRes = await fetch(`/api/bybit/tickers?category=${encodeURIComponent(category)}`);
-      const tickersJson = await tickersRes.json();
-
-      if (!tickersRes.ok || tickersJson.retCode !== 0) {
-        throw new Error(tickersJson.retMsg || 'Błąd pobierania tickerów z Bybit');
-      }
+      const tickerOutcome = await fetchPublicMarketJson(
+        `/api/bybit/tickers?category=${encodeURIComponent(category)}`,
+        `/v5/market/tickers?category=${encodeURIComponent(category)}`
+      );
+      const tickersJson = tickerOutcome.json;
 
       const tickerList = (tickersJson.result?.list ?? []) as Array<{
         symbol: string;
@@ -265,11 +307,11 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           chunk.map(async (base) => {
             const { symbol, category: symCat } = formatBybitSymbol(base, cfg.marketType, cfg.quoteCurrency);
             try {
-              const res = await fetch(
-                `/api/bybit/klines?category=${symCat}&symbol=${encodeURIComponent(symbol)}&interval=${cfg.timeframe}&limit=120`
+              const outcome = await fetchPublicMarketJson(
+                `/api/bybit/klines?category=${symCat}&symbol=${encodeURIComponent(symbol)}&interval=${cfg.timeframe}&limit=120`,
+                `/v5/market/kline?category=${symCat}&symbol=${encodeURIComponent(symbol)}&interval=${cfg.timeframe}&limit=120`
               );
-              if (!res.ok) return;
-              const data = await res.json();
+              const data = outcome.json;
               if (data.retCode === 0 && Array.isArray(data.result?.list)) {
                 const parsed = parseBybitKlines(data.result.list);
                 if (parsed.length > 0) {
@@ -293,7 +335,13 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         latencyMs: prev.connected && prev.latencyMs > 0 ? prev.latencyMs : restLatency,
       }));
 
-      setMarketError(null);
+      if (tickerOutcome.usedBrowserFallback && tickerOutcome.serverError) {
+        setMarketError(
+          `Serwer Railway zablokowany przez Bybit (${tickerOutcome.serverError}). Wykresy działają z Twojej przeglądarki, ale do działania bota 24/7 na serwerze zmień region Railway na EU West (Amsterdam) / Singapore lub ustaw BYBIT_PROXY_URL.`
+        );
+      } else {
+        setMarketError(null);
+      }
     } catch (err) {
       setMarketError(err instanceof Error ? err.message : 'Błąd połączenia z Bybit API');
     } finally {
@@ -802,6 +850,8 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     privateAccount,
     serverStartedAt,
     serverLastMarketSyncAt,
+    serverMarketError,
+    networkDiagnostics,
     refreshPrivateAccount,
     togglePauseBot,
     resumeFromKillSwitch,
