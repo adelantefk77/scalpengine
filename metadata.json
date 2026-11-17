@@ -1,0 +1,6 @@
+{
+  "name": "ScalpEngine — Bybit Scalping Terminal",
+  "description": "High-win-ratio high-frequency mean-reversion scalping terminal, multi-pair Bybit v5 market scanner, paper execution engine, and historical backtester.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
