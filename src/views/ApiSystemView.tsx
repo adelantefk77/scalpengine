@@ -240,8 +240,7 @@ export const ApiSystemView: React.FC = () => {
 {`BYBIT_ENV="demo"
 BYBIT_API_KEY="TWOJ_KLUCZ_DEMO_Z_BYBIT"
 BYBIT_API_SECRET="TWOJ_SEKRET_DEMO_Z_BYBIT"
-# Opcjonalnie przy błędzie HTTP 403 na Railway:
-BYBIT_PROXY_URL="http://user:pass@proxy-host:port"`}
+APP_PASSWORD="TWOJE_BEZPIECZNE_HASLO_LOGOWANIA"`}
             </pre>
           </div>
         </div>

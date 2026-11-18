@@ -211,7 +211,11 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const syncDaemonState = useCallback(async () => {
     try {
-      const res = await fetch('/api/bot/state');
+      const res = await fetch('/api/bot/state', { credentials: 'include' });
+      if (res.status === 401) {
+        window.dispatchEvent(new CustomEvent('scalpengine:unauthorized'));
+        return;
+      }
       if (!res.ok) return;
       const json = (await res.json()) as DaemonSnapshotResponse;
       if (json.ok) {

@@ -1,4 +1,5 @@
 import React from 'react';
+import { AuthGate } from './components/AuthGate';
 import { Layout } from './components/Layout';
 import { BotProvider, useBot } from './engine/botContext';
 import { ApiSystemView } from './views/ApiSystemView';
@@ -31,10 +32,12 @@ const ActiveRouteView: React.FC = () => {
 
 export default function App() {
   return (
-    <BotProvider>
-      <Layout>
-        <ActiveRouteView />
-      </Layout>
-    </BotProvider>
+    <AuthGate>
+      <BotProvider>
+        <Layout>
+          <ActiveRouteView />
+        </Layout>
+      </BotProvider>
+    </AuthGate>
   );
 }

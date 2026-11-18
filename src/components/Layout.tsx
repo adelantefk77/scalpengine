@@ -6,6 +6,7 @@ import {
   History,
   LayoutDashboard,
   LineChart,
+  LogOut,
   Menu,
   Pause,
   Play,
@@ -13,6 +14,7 @@ import {
   Terminal,
   X,
 } from 'lucide-react';
+import { useAuth } from './AuthGate';
 import { useBot } from '../engine/botContext';
 import { formatUsd } from '../engine/format';
 import { NavRoute } from '../engine/types';
@@ -51,6 +53,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
     activePositions,
     toast,
   } = useBot();
+  const { authEnabled, expiresAt, logout } = useAuth();
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [killModalOpen, setKillModalOpen] = useState(false);
@@ -159,30 +162,59 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
           </nav>
         </div>
 
-        {/* Bottom Real WS Status */}
-        <div className="p-3 m-3 rounded-lg bg-surface-container border border-white/5 flex flex-col gap-1.5">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+        {/* Bottom Real WS Status + Session */}
+        <div className="p-3 m-3 flex flex-col gap-2">
+          {authEnabled && (
+            <div className="p-2.5 rounded-lg bg-surface-container border border-white/5 flex items-center justify-between gap-2">
+              <div className="flex flex-col min-w-0">
+                <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-tertiary">
+                  Sesja 4h Aktywna
+                </span>
+                <span className="font-mono text-[10px] text-on-surface-variant tabular-nums">
+                  {expiresAt
+                    ? `Wygasa o ${new Date(expiresAt).toLocaleTimeString('pl-PL', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}`
+                    : 'Chronione hasłem'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => void logout()}
+                title="Wyloguj z terminala"
+                className="p-1.5 rounded-md bg-surface-container-high hover:bg-error-container hover:text-on-error-container text-on-surface-variant transition-colors shrink-0"
+                aria-label="Wyloguj"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
+          <div className="p-3 rounded-lg bg-surface-container border border-white/5 flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`inline-block h-2 w-2 rounded-full ${
+                    wsStatus.connected ? 'bg-tertiary' : 'bg-primary-container'
+                  }`}
+                />
+                <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-on-surface-variant">
+                  Bybit Feed
+                </span>
+              </div>
               <span
-                className={`inline-block h-2 w-2 rounded-full ${
-                  wsStatus.connected ? 'bg-tertiary' : 'bg-primary-container'
+                className={`font-mono text-[11px] font-bold tabular-nums ${
+                  wsStatus.connected ? 'text-tertiary' : 'text-primary'
                 }`}
-              />
-              <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-on-surface-variant">
-                Bybit Feed
+              >
+                {wsStatus.latencyMs > 0 ? `${wsStatus.latencyMs}ms` : 'REST'}
               </span>
             </div>
-            <span
-              className={`font-mono text-[11px] font-bold tabular-nums ${
-                wsStatus.connected ? 'text-tertiary' : 'text-primary'
-              }`}
-            >
-              {wsStatus.latencyMs > 0 ? `${wsStatus.latencyMs}ms` : 'REST'}
-            </span>
-          </div>
-          <div className="flex items-center justify-between font-mono text-[10px] text-on-surface-variant">
-            <span>{wsStatus.connected ? 'WebSocket Live' : 'REST Fallback'}</span>
-            <span className="tabular-nums">{wsStatus.messagesReceived.toLocaleString('en-US')} msg</span>
+            <div className="flex items-center justify-between font-mono text-[10px] text-on-surface-variant">
+              <span>{wsStatus.connected ? 'WebSocket Live' : 'REST Fallback'}</span>
+              <span className="tabular-nums">{wsStatus.messagesReceived.toLocaleString('en-US')} msg</span>
+            </div>
           </div>
         </div>
       </aside>

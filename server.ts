@@ -2,6 +2,13 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  getAuthStatusFromRequest,
+  handleLoginRequest,
+  handleLogoutRequest,
+  isAuthEnabled,
+  requireAuthMiddleware,
+} from './serverAuth';
 import { serverBot } from './serverBot';
 import {
   cancelBybitOrder,
@@ -21,12 +28,13 @@ const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json());
 
   // Start autonomous 24/7 server-side trading engine immediately
   serverBot.start();
 
-  // Public health endpoint
+  // Public health endpoint (for Railway healthcheck)
   app.get('/api/health', async (_req, res) => {
     const netDiag = getBybitNetworkDiagnostics();
     const envCfg = getBybitEnvConfig();
@@ -44,6 +52,7 @@ async function startServer() {
         bybitServerTime: result.data.result ?? null,
         privateEnv: envCfg.env,
         privateConfigured: envCfg.configured,
+        authEnabled: isAuthEnabled(),
         serverDaemon: true,
         networkDiagnostics: { ...netDiag, activePublicHost: result.host },
       });
@@ -52,12 +61,27 @@ async function startServer() {
         ok: false,
         privateEnv: envCfg.env,
         privateConfigured: envCfg.configured,
+        authEnabled: isAuthEnabled(),
         serverDaemon: true,
         networkDiagnostics: netDiag,
         error: err instanceof Error ? err.message : 'Bybit unreachable',
       });
     }
   });
+
+  // =========================================================================
+  // Terminal Authentication API (4-hour HttpOnly HMAC Session)
+  // =========================================================================
+
+  app.get('/api/auth/status', (req, res) => {
+    res.json({ ok: true, ...getAuthStatusFromRequest(req) });
+  });
+
+  app.post('/api/auth/login', handleLoginRequest);
+  app.post('/api/auth/logout', handleLogoutRequest);
+
+  // Protect all trading daemon & Bybit proxy endpoints when APP_PASSWORD is set
+  app.use(['/api/bot', '/api/bybit'], requireAuthMiddleware);
 
   // =========================================================================
   // 24/7 Autonomous Bot Daemon Control & Telemetry API
