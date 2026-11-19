@@ -71,3 +71,29 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #343941;
 }
+
+@keyframes scalp-ticker-scroll {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+.ticker-marquee-track {
+  display: flex;
+  width: max-content;
+  will-change: transform;
+  animation: scalp-ticker-scroll 34s linear infinite;
+}
+
+.ticker-marquee-container:hover .ticker-marquee-track {
+  animation-play-state: paused;
+}
+
+.ticker-marquee-mask {
+  mask-image: linear-gradient(to right, transparent 0%, black 22px, black calc(100% - 22px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, transparent 0%, black 22px, black calc(100% - 22px), transparent 100%);
+}
+

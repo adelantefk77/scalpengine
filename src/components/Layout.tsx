@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from './AuthGate';
 import { useBot } from '../engine/botContext';
-import { formatUsd } from '../engine/format';
+import { formatPrice, formatUsd } from '../engine/format';
 import { NavRoute } from '../engine/types';
 
 interface NavItem {
@@ -50,6 +50,9 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
     todayRealizedPnl,
     unrealizedPnl,
     wsStatus,
+    pairTelemetries,
+    selectedPairBase,
+    setSelectedPairBase,
     activePositions,
     toast,
   } = useBot();
@@ -74,6 +77,11 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
   const totalTodayPnl = todayRealizedPnl + unrealizedPnl;
   const totalTodayPct = equity > 0 ? (totalTodayPnl / equity) * 100 : 0;
+
+  const activePositionBases = new Set(activePositions.map((p) => p.base));
+  const tickerPairs = config.activePairs
+    .map((base) => pairTelemetries.find((p) => p.base === base))
+    .filter((p): p is NonNullable<typeof p> => Boolean(p && p.lastPrice > 0));
 
   return (
     <div className="min-h-screen bg-surface-container-lowest text-on-surface flex">
@@ -227,8 +235,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       {/* Main Content Shell */}
       <div className="lg:pl-64 flex-1 flex flex-col min-h-screen w-full">
         {/* Top Fixed Header */}
-        <header className="fixed top-0 left-0 lg:left-64 right-0 h-16 bg-surface/90 backdrop-blur-xl z-30 px-3 lg:px-4 border-b border-white/5 flex items-center justify-between gap-2 overflow-hidden">
-          <div className="flex items-center gap-2 min-w-0 shrink">
+        <header className="fixed top-0 left-0 lg:left-64 right-0 h-16 bg-surface/90 backdrop-blur-xl z-30 px-3 lg:px-4 border-b border-white/5 flex items-center justify-between gap-2.5 overflow-hidden">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
@@ -242,20 +250,6 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               <span className="h-2 w-2 rounded-full bg-primary-container" />
               <span className="font-mono text-[10px] uppercase tracking-wider text-on-surface font-bold">
                 {marketLabel}
-              </span>
-            </div>
-
-            <div className="hidden 2xl:flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-surface-container-low whitespace-nowrap shrink-0">
-              <span
-                className={`h-2 w-2 rounded-full ${
-                  wsStatus.connected ? 'bg-tertiary' : 'bg-primary-container'
-                }`}
-              />
-              <span className="font-mono text-[11px] text-on-surface font-medium tabular-nums">
-                Bybit WS:{' '}
-                <span className={wsStatus.connected ? 'text-tertiary' : 'text-primary'}>
-                  {wsStatus.connected ? `Connected (${wsStatus.latencyMs || 1} ms)` : 'REST Sync'}
-                </span>
               </span>
             </div>
 
@@ -366,6 +360,64 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
             </div>
           </div>
 
+          {/* Center Auto-Scrolling Live Crypto Price Ticker Tape (md+ desktop/tablet/preview) */}
+          <div
+            className="hidden md:flex flex-1 min-w-0 h-9 items-center rounded-lg bg-surface-container border border-white/10 overflow-hidden ticker-marquee-container ticker-marquee-mask"
+            title="Ceny na żywo aktywnych par skanera (najedź aby zatrzymać, kliknij aby przejść do wykresu)"
+          >
+            {tickerPairs.length > 0 ? (
+              <div className="ticker-marquee-track">
+                {[0, 1].map((dupIdx) => (
+                  <div key={dupIdx} className="flex items-center shrink-0">
+                    {tickerPairs.map((pair) => {
+                      const isUp = pair.change24hPct >= 0;
+                      const isSelected = selectedPairBase === pair.base;
+                      const hasOpenPos = activePositionBases.has(pair.base);
+                      return (
+                        <button
+                          key={`${dupIdx}-${pair.base}`}
+                          type="button"
+                          onClick={() => {
+                            setSelectedPairBase(pair.base);
+                            if (activeRoute !== 'dashboard') {
+                              setActiveRoute('dashboard');
+                            }
+                          }}
+                          className={`flex items-center gap-1.5 px-3 py-1 font-mono text-[11px] whitespace-nowrap transition-colors border-r border-white/5 hover:bg-surface-container-high/80 ${
+                            isSelected ? 'text-primary' : 'text-on-surface'
+                          }`}
+                        >
+                          {hasOpenPos && (
+                            <span
+                              className="h-1.5 w-1.5 rounded-full bg-tertiary animate-pulse shrink-0"
+                              title="Otwarta pozycja"
+                            />
+                          )}
+                          <span className="font-bold tracking-tight">{pair.base}</span>
+                          <span className="tabular-nums text-on-surface font-semibold">
+                            {formatPrice(pair.lastPrice)}
+                          </span>
+                          <span
+                            className={`tabular-nums text-[10px] font-bold ${
+                              isUp ? 'text-tertiary' : 'text-error'
+                            }`}
+                          >
+                            {isUp ? '+' : ''}
+                            {pair.change24hPct.toFixed(2)}%
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="px-3 font-mono text-[11px] text-on-surface-variant whitespace-nowrap">
+                Synchronizacja cen Bybit...
+              </div>
+            )}
+          </div>
+
           {/* Right Header Telemetry & Kill Switch */}
           <div className="flex items-center gap-2 shrink-0">
             <div className="flex items-center gap-2.5 px-2.5 py-1 rounded-lg bg-surface-container-low whitespace-nowrap">
@@ -377,8 +429,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                   {formatUsd(equity)}
                 </span>
               </div>
-              <div className="h-6 w-[1px] bg-surface-container-high hidden md:block" />
-              <div className="hidden md:flex flex-col">
+              <div className="h-6 w-[1px] bg-surface-container-high hidden lg:block" />
+              <div className="hidden lg:flex flex-col">
                 <span className="font-mono text-[9px] text-on-surface-variant uppercase tracking-wider">
                   Dzisiejszy PnL
                 </span>
@@ -405,8 +457,54 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
           </div>
         </header>
 
+        {/* Mobile / Narrow Preview Sub-Header Ticker Tape (< md) */}
+        <div className="md:hidden fixed top-16 left-0 right-0 h-8 bg-surface/95 backdrop-blur-md z-20 border-b border-white/5 flex items-center overflow-hidden ticker-marquee-container ticker-marquee-mask">
+          {tickerPairs.length > 0 ? (
+            <div className="ticker-marquee-track">
+              {[0, 1].map((dupIdx) => (
+                <div key={dupIdx} className="flex items-center shrink-0">
+                  {tickerPairs.map((pair) => {
+                    const isUp = pair.change24hPct >= 0;
+                    const isSelected = selectedPairBase === pair.base;
+                    const hasOpenPos = activePositionBases.has(pair.base);
+                    return (
+                      <button
+                        key={`m-${dupIdx}-${pair.base}`}
+                        type="button"
+                        onClick={() => {
+                          setSelectedPairBase(pair.base);
+                          if (activeRoute !== 'dashboard') {
+                            setActiveRoute('dashboard');
+                          }
+                        }}
+                        className={`flex items-center gap-1.5 px-2.5 py-0.5 font-mono text-[11px] whitespace-nowrap border-r border-white/5 ${
+                          isSelected ? 'text-primary' : 'text-on-surface'
+                        }`}
+                      >
+                        {hasOpenPos && (
+                          <span className="h-1.5 w-1.5 rounded-full bg-tertiary animate-pulse shrink-0" />
+                        )}
+                        <span className="font-bold">{pair.base}</span>
+                        <span className="tabular-nums font-semibold">{formatPrice(pair.lastPrice)}</span>
+                        <span className={`tabular-nums text-[10px] font-bold ${isUp ? 'text-tertiary' : 'text-error'}`}>
+                          {isUp ? '+' : ''}
+                          {pair.change24hPct.toFixed(2)}%
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="px-3 font-mono text-[10px] text-on-surface-variant">
+              Synchronizacja cen Bybit...
+            </div>
+          )}
+        </div>
+
         {/* Main Viewport */}
-        <main className="w-full pt-20 pb-8 px-3 lg:px-4 flex-1 bg-surface-container-lowest">
+        <main className="w-full pt-28 md:pt-20 pb-8 px-3 lg:px-4 flex-1 bg-surface-container-lowest">
           {children}
         </main>
       </div>
