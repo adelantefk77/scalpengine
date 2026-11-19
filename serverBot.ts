@@ -66,9 +66,11 @@ interface PersistedBotState {
   paperEquity: number;
   closedTrades: ClosedTrade[];
   events: BotEvent[];
+  migratedAssets?: string[];
 }
 
 const DEFAULT_START_EQUITY = 25000;
+const NEW_RECOMMENDED_ASSETS = ['ENA', 'WLD', 'HBAR'];
 const STATE_FILE_PATH = path.resolve(process.cwd(), '.scalpengine-state.json');
 
 class ServerBotDaemon {
@@ -83,6 +85,7 @@ class ServerBotDaemon {
   private closedTrades: ClosedTrade[] = [];
   private exchangeClosedTrades: ClosedTrade[] = [];
   private events: BotEvent[] = [];
+  private migratedAssets: string[] = [...NEW_RECOMMENDED_ASSETS];
 
   private privateAccount: PrivateAccountSnapshot = {
     equity: 0,
@@ -155,6 +158,17 @@ class ServerBotDaemon {
         const parsed = JSON.parse(raw) as Partial<PersistedBotState>;
         if (parsed.config) {
           this.config = { ...DEFAULT_STRATEGY_CONFIG, ...parsed.config };
+          const prevMigrated = new Set(Array.isArray(parsed.migratedAssets) ? parsed.migratedAssets : []);
+          const toAdd = NEW_RECOMMENDED_ASSETS.filter(
+            (asset) => !prevMigrated.has(asset) && !this.config.activePairs.includes(asset)
+          );
+          if (toAdd.length > 0) {
+            this.config = {
+              ...this.config,
+              activePairs: [...this.config.activePairs, ...toAdd],
+            };
+          }
+          this.migratedAssets = Array.from(new Set([...prevMigrated, ...NEW_RECOMMENDED_ASSETS]));
         }
         if (parsed.botState === 'RUNNING' || parsed.botState === 'PAUSED' || parsed.botState === 'HALTED') {
           this.botState = parsed.botState;
@@ -209,6 +223,7 @@ class ServerBotDaemon {
           paperEquity: this.paperEquity,
           closedTrades: this.closedTrades.slice(0, 500),
           events: this.events.slice(0, 100),
+          migratedAssets: this.migratedAssets,
         };
         fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(payload), 'utf-8');
       } catch {

@@ -308,6 +308,9 @@ export const ALL_SCANNER_ASSETS = [
   'DOT',
   'LTC',
   'UNI',
+  'ENA',
+  'WLD',
+  'HBAR',
 ];
 
 export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
@@ -347,7 +350,7 @@ export const PRESET_CONFIGS: Record<PresetId, Partial<StrategyConfig>> = {
   conservative: {
     preset: 'conservative',
     timeframe: '5',
-    activePairs: ['SOL', 'ETH', 'BTC', 'NEAR', 'AVAX', 'SUI', 'DOGE', 'XRP', 'LINK', 'APT'],
+    activePairs: ['SOL', 'ETH', 'BTC', 'NEAR', 'AVAX', 'SUI', 'DOGE', 'XRP', 'LINK', 'ENA'],
     limitOffsetTicks: 5,
     orderTtlSec: 90,
     zScoreThreshold: 2.35,
