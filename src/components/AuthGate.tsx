@@ -193,7 +193,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                 htmlFor="terminal-password"
                 className="font-mono text-[11px] uppercase tracking-wider text-on-surface-variant font-semibold"
               >
-                Hasło dostępu (Railway Variable)
+                Hasło dostępu
               </label>
               <div className="relative flex items-center">
                 <Lock className="w-4 h-4 text-on-surface-variant absolute left-3 pointer-events-none" />
@@ -204,7 +204,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
                   autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Wpisz hasło z APP_PASSWORD..."
+                  placeholder="Wpisz hasło..."
                   className="w-full bg-surface-container-lowest border border-white/10 focus:border-primary/60 rounded-lg pl-9 pr-10 py-2.5 font-mono text-sm text-on-surface focus:outline-none transition-colors"
                 />
                 <button

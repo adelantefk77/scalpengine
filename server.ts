@@ -15,13 +15,15 @@ import {
   fetchBybitJson,
   fetchBybitPrivateAccount,
   fetchBybitPrivateState,
+  getAllBybitAccountsStatus,
   getBybitEnvConfig,
   getBybitNetworkDiagnostics,
   placeBybitOrder,
   triggerBybitKillSwitch,
+  type BybitEnv,
   type PrivateOrderPayload,
 } from './serverBybit';
-import type { ExecutionMode, StrategyConfig } from './src/engine/types';
+import type { ExecutionMode, PrivateEnv, StrategyConfig } from './src/engine/types';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,7 +39,7 @@ async function startServer() {
   // Public health endpoint (for Railway healthcheck)
   app.get('/api/health', async (_req, res) => {
     const netDiag = getBybitNetworkDiagnostics();
-    const envCfg = getBybitEnvConfig();
+    const envCfg = getBybitEnvConfig(serverBot.getPrivateEnv());
     try {
       const start = Date.now();
       const result = await fetchBybitJson<{ result?: { timeSecond?: string; timeNano?: string } }>(
@@ -52,6 +54,10 @@ async function startServer() {
         bybitServerTime: result.data.result ?? null,
         privateEnv: envCfg.env,
         privateConfigured: envCfg.configured,
+        accountsConfigured: {
+          demo: getBybitEnvConfig('demo').configured,
+          mainnet: getBybitEnvConfig('mainnet').configured,
+        },
         authEnabled: isAuthEnabled(),
         serverDaemon: true,
         networkDiagnostics: { ...netDiag, activePublicHost: result.host },
@@ -105,12 +111,20 @@ async function startServer() {
   });
 
   app.post('/api/bot/mode', async (req, res) => {
-    const { mode } = req.body as { mode?: ExecutionMode };
+    const { mode, env, confirmLive } = req.body as {
+      mode?: ExecutionMode;
+      env?: PrivateEnv;
+      confirmLive?: boolean;
+    };
     if (mode !== 'paper' && mode !== 'exchange') {
       res.status(400).json({ ok: false, error: 'Nieprawidłowy tryb egzekucji.' });
       return;
     }
-    const result = await serverBot.setExecutionMode(mode);
+    if (env !== undefined && env !== 'demo' && env !== 'mainnet' && env !== 'testnet') {
+      res.status(400).json({ ok: false, error: 'Nieprawidłowe środowisko Bybit (demo / mainnet).' });
+      return;
+    }
+    const result = await serverBot.setExecutionMode(mode, env, Boolean(confirmLive));
     res.status(result.ok ? 200 : 400).json({
       ...result,
       ...serverBot.getSnapshot(),
@@ -310,23 +324,35 @@ async function startServer() {
   // Direct Private Bybit v5 Trading Endpoints
   // =========================================================================
 
+  const parseRequestedEnv = (raw: unknown): BybitEnv => {
+    if (raw === 'mainnet' || raw === 'live' || raw === 'real') return 'mainnet';
+    if (raw === 'testnet') return 'testnet';
+    if (raw === 'demo') return 'demo';
+    return serverBot.getPrivateEnv();
+  };
+
   app.get('/api/bybit/private/status', (_req, res) => {
-    const cfg = getBybitEnvConfig();
+    const cfg = getBybitEnvConfig(serverBot.getPrivateEnv());
     res.json({
       configured: cfg.configured,
       env: cfg.env,
       baseUrl: cfg.privateBaseUrl,
       keyMask: cfg.keyMask,
+      accounts: getAllBybitAccountsStatus(),
     });
   });
 
-  app.get('/api/bybit/private/account', async (_req, res) => {
+  app.get('/api/bybit/private/account', async (req, res) => {
+    const targetEnv = parseRequestedEnv(req.query.env);
+    const cfg = getBybitEnvConfig(targetEnv);
     try {
-      const acct = await fetchBybitPrivateAccount();
-      res.json({ ok: true, ...acct });
+      const acct = await fetchBybitPrivateAccount(targetEnv);
+      res.json({ ok: true, env: cfg.env, baseUrl: cfg.privateBaseUrl, ...acct });
     } catch (err) {
       res.status(400).json({
         ok: false,
+        env: cfg.env,
+        baseUrl: cfg.privateBaseUrl,
         error: err instanceof Error ? err.message : 'Account fetch error',
       });
     }
@@ -334,9 +360,10 @@ async function startServer() {
 
   app.get('/api/bybit/private/state', async (req, res) => {
     const category = String(req.query.category || 'linear') as 'spot' | 'linear';
+    const targetEnv = parseRequestedEnv(req.query.env);
     try {
-      const state = await fetchBybitPrivateState(category);
-      res.json({ ok: true, ...state });
+      const state = await fetchBybitPrivateState(category, targetEnv);
+      res.json({ ok: true, env: targetEnv, ...state });
     } catch (err) {
       res.status(400).json({
         ok: false,
@@ -347,7 +374,7 @@ async function startServer() {
 
   app.post('/api/bybit/private/order', async (req, res) => {
     try {
-      const result = await placeBybitOrder(req.body as PrivateOrderPayload);
+      const result = await placeBybitOrder(req.body as PrivateOrderPayload, serverBot.getPrivateEnv());
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(400).json({
@@ -364,7 +391,7 @@ async function startServer() {
         symbol: string;
         orderId: string;
       };
-      const result = await cancelBybitOrder(category, symbol, orderId);
+      const result = await cancelBybitOrder(category, symbol, orderId, serverBot.getPrivateEnv());
       res.json({ ok: true, result });
     } catch (err) {
       res.status(400).json({
@@ -376,7 +403,7 @@ async function startServer() {
 
   app.post('/api/bybit/private/kill-switch', async (_req, res) => {
     try {
-      const result = await triggerBybitKillSwitch();
+      const result = await triggerBybitKillSwitch(serverBot.getPrivateEnv());
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(400).json({

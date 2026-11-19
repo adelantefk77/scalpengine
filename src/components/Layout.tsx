@@ -57,6 +57,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [killModalOpen, setKillModalOpen] = useState(false);
+  const [liveModalOpen, setLiveModalOpen] = useState(false);
+  const [switchingLive, setSwitchingLive] = useState(false);
 
   const marketLabel =
     config.marketType === 'spot_margin'
@@ -65,7 +67,10 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
         ? 'BYBIT / PERP USDC'
         : 'BYBIT / PERP USDT';
 
-  const envLabel = `BYBIT ${privateStatus.env.toUpperCase()}`;
+  const isDemoActive = executionMode === 'exchange' && privateStatus.env !== 'mainnet';
+  const isLiveActive = executionMode === 'exchange' && privateStatus.env === 'mainnet';
+  const demoSlot = privateStatus.accounts?.demo;
+  const liveSlot = privateStatus.accounts?.mainnet;
 
   const totalTodayPnl = todayRealizedPnl + unrealizedPnl;
   const totalTodayPct = equity > 0 ? (totalTodayPnl / equity) * 100 : 0;
@@ -255,14 +260,12 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              {/* Execution Mode Switcher: Paper vs Bybit Demo */}
+              {/* Execution Mode Switcher: Paper vs Bybit Demo vs Bybit REAL LIVE */}
               <div
-                className="flex items-center p-0.5 rounded-lg bg-surface-container border border-white/10 shrink-0"
-                title={
-                  privateStatus.configured
-                    ? `Przełącz tryb egzekucji (${privateStatus.baseUrl})`
-                    : 'Dodaj BYBIT_API_KEY i BYBIT_API_SECRET do pliku .env, aby aktywować Bybit Demo'
-                }
+                className={`flex items-center p-0.5 rounded-lg bg-surface-container border shrink-0 ${
+                  isLiveActive ? 'border-error/60 shadow-[0_0_12px_rgba(246,70,93,0.25)]' : 'border-white/10'
+                }`}
+                title="Przełącz środowisko egzekucji: Paper / Bybit Demo / Bybit REAL (Mainnet)"
               >
                 <button
                   type="button"
@@ -277,19 +280,42 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                 </button>
                 <button
                   type="button"
-                  onClick={() => void setExecutionMode('exchange')}
+                  onClick={() => void setExecutionMode('exchange', 'demo')}
                   className={`px-2 py-1 rounded-md font-mono text-[10px] font-bold uppercase tracking-wider transition-colors flex items-center gap-1 whitespace-nowrap ${
-                    executionMode === 'exchange'
+                    isDemoActive
                       ? 'bg-tertiary-container/25 text-tertiary'
                       : 'text-on-surface-variant hover:text-on-surface'
                   }`}
                 >
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${
-                      privateStatus.configured ? 'bg-tertiary' : 'bg-outline'
+                      demoSlot?.configured ? 'bg-tertiary' : 'bg-outline'
                     }`}
                   />
-                  <span>{envLabel}</span>
+                  <span>DEMO</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isLiveActive) return;
+                    setLiveModalOpen(true);
+                  }}
+                  className={`px-2 py-1 rounded-md font-mono text-[10px] font-bold uppercase tracking-wider transition-colors flex items-center gap-1 whitespace-nowrap ${
+                    isLiveActive
+                      ? 'bg-error text-on-error shadow-[0_0_10px_rgba(246,70,93,0.4)]'
+                      : 'text-on-surface-variant hover:text-error'
+                  }`}
+                >
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      isLiveActive
+                        ? 'bg-white animate-pulse'
+                        : liveSlot?.configured
+                          ? 'bg-error'
+                          : 'bg-outline'
+                    }`}
+                  />
+                  <span>REAL LIVE</span>
                 </button>
               </div>
 
@@ -402,7 +428,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                 </h3>
                 <p className="text-xs text-on-surface-variant">
                   {executionMode === 'exchange'
-                    ? `Natychmiastowa likwidacja otwartych pozycji na Bybit ${privateStatus.env.toUpperCase()}`
+                    ? `Natychmiastowa likwidacja otwartych pozycji na Bybit ${privateStatus.env === 'mainnet' ? 'REAL LIVE' : privateStatus.env.toUpperCase()}`
                     : 'Natychmiastowa likwidacja otwartych pozycji symulacyjnych (Paper)'}
                 </p>
               </div>
@@ -432,6 +458,94 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                 Potwierdź Kill Switch
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* REAL Mainnet Activation Confirmation Modal */}
+      {liveModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-surface-container border border-error/50 rounded-xl max-w-md w-full p-6 shadow-2xl flex flex-col gap-4">
+            <div className="flex items-center gap-3 text-error">
+              <div className="w-10 h-10 rounded-lg bg-error-container/40 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-display text-lg font-bold text-on-surface">
+                  Przełączenie na konto REAL (Mainnet)
+                </h3>
+                <p className="font-mono text-[11px] text-error">
+                  https://api.bybit.com · PRAWDZIWE ŚRODKI
+                </p>
+              </div>
+            </div>
+
+            {liveSlot?.configured ? (
+              <>
+                <p className="text-sm text-on-surface-variant leading-relaxed">
+                  Bot 24/7 zacznie wysyłać <strong className="text-on-surface">prawdziwe zlecenia</strong> na Twoje konto Bybit Mainnet przy użyciu klucza{' '}
+                  <code className="font-mono text-tertiary bg-surface-container-lowest px-1.5 py-0.5 rounded">
+                    {liveSlot.keyMask}
+                  </code>
+                  . Upewnij się, że rozmiar pozycji, dźwignia ({config.leverage}x) i Daily Max Loss ({config.dailyMaxLossPct}%) są poprawnie ustawione.
+                </p>
+                <div className="flex items-center justify-end gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setLiveModalOpen(false)}
+                    className="px-4 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-on-surface text-sm font-medium transition-colors"
+                  >
+                    Anuluj
+                  </button>
+                  <button
+                    type="button"
+                    disabled={switchingLive}
+                    onClick={async () => {
+                      setSwitchingLive(true);
+                      try {
+                        const ok = await setExecutionMode('exchange', 'mainnet', true);
+                        if (ok) setLiveModalOpen(false);
+                      } finally {
+                        setSwitchingLive(false);
+                      }
+                    }}
+                    className="px-4 py-2 rounded-lg bg-error hover:bg-error/90 text-on-error font-mono text-xs font-bold uppercase tracking-wider transition-colors disabled:opacity-50"
+                  >
+                    {switchingLive ? 'Łączenie...' : 'Aktywuj REAL LIVE'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-on-surface-variant leading-relaxed">
+                  Klucze realnego konta Bybit nie są jeszcze ustawione na serwerze. Dodaj je w{' '}
+                  <strong className="text-on-surface">Railway → Variables</strong> (bez uprawnienia Withdraw / Wypłaty!):
+                </p>
+                <pre className="p-3 rounded-lg bg-surface-container-lowest border border-white/10 font-mono text-[11px] text-tertiary overflow-x-auto">
+{`BYBIT_LIVE_API_KEY="TWOJ_KLUCZ_REAL"
+BYBIT_LIVE_API_SECRET="TWOJ_SEKRET_REAL"`}
+                </pre>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLiveModalOpen(false);
+                      setActiveRoute('api-i-system');
+                    }}
+                    className="px-4 py-2 rounded-lg bg-primary-container text-on-primary-container hover:bg-primary text-xs font-bold transition-colors"
+                  >
+                    Przejdź do API i System
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLiveModalOpen(false)}
+                    className="px-4 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-on-surface text-xs font-medium transition-colors"
+                  >
+                    Zamknij
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

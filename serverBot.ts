@@ -6,8 +6,10 @@ import {
   fetchBybitJson,
   fetchBybitPrivateAccount,
   fetchBybitPrivateState,
+  getAllBybitAccountsStatus,
   getBybitEnvConfig,
   getBybitNetworkDiagnostics,
+  getDefaultBybitEnv,
   placeBybitOrder,
   triggerBybitKillSwitch,
 } from './serverBybit';
@@ -24,6 +26,7 @@ import {
   IndicatorPoint,
   PendingOrder,
   PrivateAccountSnapshot,
+  PrivateEnv,
   PrivateExchangeStatus,
   StrategyConfig,
   formatBybitSymbol,
@@ -58,6 +61,7 @@ interface SignalSnapshot {
 interface PersistedBotState {
   config: StrategyConfig;
   executionMode: ExecutionMode;
+  privateEnv?: PrivateEnv;
   botState: BotRunState;
   paperEquity: number;
   closedTrades: ClosedTrade[];
@@ -70,6 +74,7 @@ const STATE_FILE_PATH = path.resolve(process.cwd(), '.scalpengine-state.json');
 class ServerBotDaemon {
   private config: StrategyConfig = { ...DEFAULT_STRATEGY_CONFIG };
   private executionMode: ExecutionMode = 'paper';
+  private privateEnv: PrivateEnv = getDefaultBybitEnv();
   private botState: BotRunState = 'RUNNING';
   private paperEquity: number = DEFAULT_START_EQUITY;
 
@@ -121,22 +126,29 @@ class ServerBotDaemon {
 
   constructor() {
     this.loadPersistedState();
-    const envCfg = getBybitEnvConfig();
+    const envCfg = getBybitEnvConfig(this.privateEnv);
     if (!envCfg.configured) {
-      this.executionMode = 'paper';
+      // Fallback to demo if configured, else paper
+      const demoCfg = getBybitEnvConfig('demo');
+      if (demoCfg.configured) {
+        this.privateEnv = 'demo';
+      } else {
+        this.executionMode = 'paper';
+      }
     }
+    const finalCfg = getBybitEnvConfig(this.privateEnv);
+    const envLabel = finalCfg.env === 'mainnet' ? 'BYBIT REAL LIVE' : `BYBIT ${finalCfg.env.toUpperCase()}`;
     this.pushEvent({
       category: 'SYSTEM',
       tag: '24/7 DAEMON',
-      badgeText: `BYBIT ${envCfg.env.toUpperCase()}`,
-      message: envCfg.configured
-        ? `Uruchomiono autonomiczny silnik 24/7 na serwerze (Tryb: ${this.executionMode === 'exchange' ? `BYBIT ${envCfg.env.toUpperCase()}` : 'PAPER'}, Klucz: ${envCfg.keyMask}).`
-        : 'Uruchomiono autonomiczny silnik 24/7 na serwerze w trybie PAPER (brak kluczy BYBIT_API_KEY w zmiennych środowiskowych).',
+      badgeText: envLabel,
+      message: finalCfg.configured
+        ? `Uruchomiono autonomiczny silnik 24/7 na serwerze (Tryb: ${this.executionMode === 'exchange' ? envLabel : 'PAPER'}, Klucz: ${finalCfg.keyMask}).`
+        : 'Uruchomiono autonomiczny silnik 24/7 na serwerze w trybie PAPER (brak kluczy Bybit w zmiennych środowiskowych).',
     });
   }
 
   private loadPersistedState() {
-    const envCfg = getBybitEnvConfig();
     try {
       if (fs.existsSync(STATE_FILE_PATH)) {
         const raw = fs.readFileSync(STATE_FILE_PATH, 'utf-8');
@@ -156,6 +168,14 @@ class ServerBotDaemon {
         if (Array.isArray(parsed.events)) {
           this.events = parsed.events.slice(0, 100);
         }
+        if (
+          parsed.privateEnv === 'demo' ||
+          parsed.privateEnv === 'mainnet' ||
+          parsed.privateEnv === 'testnet'
+        ) {
+          this.privateEnv = parsed.privateEnv;
+        }
+        const envCfg = getBybitEnvConfig(this.privateEnv);
         if (parsed.executionMode === 'exchange' && envCfg.configured) {
           this.executionMode = 'exchange';
         } else if (parsed.executionMode === 'paper') {
@@ -169,8 +189,9 @@ class ServerBotDaemon {
       // ignore invalid state file
     }
 
-    // Fresh container (e.g. Railway deploy with env vars set): auto-enable exchange mode if configured!
-    if (envCfg.configured) {
+    // Fresh container (e.g. Railway deploy with env vars set): auto-enable configured default env (demo by default for safety)
+    const defaultCfg = getBybitEnvConfig(this.privateEnv);
+    if (defaultCfg.configured) {
       this.executionMode = 'exchange';
     }
   }
@@ -183,6 +204,7 @@ class ServerBotDaemon {
         const payload: PersistedBotState = {
           config: this.config,
           executionMode: this.executionMode,
+          privateEnv: this.privateEnv,
           botState: this.botState,
           paperEquity: this.paperEquity,
           closedTrades: this.closedTrades.slice(0, 500),
@@ -207,9 +229,13 @@ class ServerBotDaemon {
     this.schedulePersist();
   }
 
+  public getPrivateEnv(): PrivateEnv {
+    return this.privateEnv;
+  }
+
   public start() {
     void this.refreshKlines();
-    if (getBybitEnvConfig().configured) {
+    if (getBybitEnvConfig(this.privateEnv).configured) {
       void this.syncExchangeState();
     }
 
@@ -380,15 +406,20 @@ class ServerBotDaemon {
   }
 
   public async syncExchangeState(forceClosedPnl = false): Promise<boolean> {
-    const envCfg = getBybitEnvConfig();
+    const activeEnv = this.privateEnv;
+    const envCfg = getBybitEnvConfig(activeEnv);
     if (!envCfg.configured) {
+      const missingHint =
+        activeEnv === 'mainnet'
+          ? 'Brak kluczy BYBIT_LIVE_API_KEY / BYBIT_LIVE_API_SECRET w zmiennych środowiskowych.'
+          : 'Brak kluczy BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET (lub BYBIT_API_KEY / BYBIT_API_SECRET) w zmiennych środowiskowych.';
       this.privateAccount = {
         equity: 0,
         availableBalance: 0,
         walletBalance: 0,
         unrealizedPnl: 0,
         updatedAt: null,
-        error: 'Brak kluczy BYBIT_API_KEY / BYBIT_API_SECRET w zmiennych środowiskowych.',
+        error: missingHint,
       };
       return false;
     }
@@ -397,8 +428,8 @@ class ServerBotDaemon {
     const category = resolveBybitCategory(cfg.marketType);
     try {
       const [acct, state] = await Promise.all([
-        fetchBybitPrivateAccount(),
-        fetchBybitPrivateState(category),
+        fetchBybitPrivateAccount(activeEnv),
+        fetchBybitPrivateState(category, activeEnv),
       ]);
 
       this.privateAccount = {
@@ -512,7 +543,7 @@ class ServerBotDaemon {
         (forceClosedPnl || positionDisappeared || Date.now() - this.lastClosedPnlSyncAt >= 20000)
       ) {
         try {
-          const rawClosed = await fetchBybitClosedPnl(28);
+          const rawClosed = await fetchBybitClosedPnl(28, activeEnv);
           this.lastClosedPnlSyncAt = Date.now();
           const localHints = [...this.exchangeClosedTrades];
 
@@ -622,21 +653,25 @@ class ServerBotDaemon {
     };
 
     try {
-      const res = await placeBybitOrder({
-        category,
-        symbol: s.symbol,
-        side: side === 'LONG' ? 'Buy' : 'Sell',
-        orderType: isManual || cfg.postOnly ? 'Limit' : 'Market',
-        qtyUsd: notionalUsd,
-        price: limitPrice,
-        postOnly: isManual ? true : cfg.postOnly,
-        leverage: cfg.leverage,
-        isSpotMargin: cfg.marketType === 'spot_margin',
-        tpPrice: category === 'linear' ? tpPrice : undefined,
-        slPrice: category === 'linear' ? slPrice : undefined,
-      });
+      const activeEnv = this.privateEnv;
+      const res = await placeBybitOrder(
+        {
+          category,
+          symbol: s.symbol,
+          side: side === 'LONG' ? 'Buy' : 'Sell',
+          orderType: isManual || cfg.postOnly ? 'Limit' : 'Market',
+          qtyUsd: notionalUsd,
+          price: limitPrice,
+          postOnly: isManual ? true : cfg.postOnly,
+          leverage: cfg.leverage,
+          isSpotMargin: cfg.marketType === 'spot_margin',
+          tpPrice: category === 'linear' ? tpPrice : undefined,
+          slPrice: category === 'linear' ? slPrice : undefined,
+        },
+        activeEnv
+      );
 
-      const envUpper = getBybitEnvConfig().env.toUpperCase();
+      const envUpper = activeEnv === 'mainnet' ? 'REAL LIVE' : activeEnv.toUpperCase();
       this.pushEvent({
         category: 'SIGNAL',
         tag: isManual ? 'BYBIT RĘCZNE' : 'BYBIT SYGNAŁ',
@@ -1094,7 +1129,7 @@ class ServerBotDaemon {
     if (this.executionMode === 'exchange') {
       const category = resolveBybitCategory(this.config.marketType);
       try {
-        await cancelBybitOrder(category, ord.symbol, orderId);
+        await cancelBybitOrder(category, ord.symbol, orderId, this.privateEnv);
         this.pendingOrders = this.pendingOrders.filter((o) => o.id !== orderId);
         this.pushEvent({
           category: 'SYSTEM',
@@ -1136,15 +1171,18 @@ class ServerBotDaemon {
       this.inFlightClosures.add(positionId);
       const category = resolveBybitCategory(this.config.marketType);
       try {
-        await placeBybitOrder({
-          category,
-          symbol: pos.symbol,
-          side: pos.side === 'LONG' ? 'Sell' : 'Buy',
-          orderType: 'Market',
-          qtyBase: pos.qty,
-          reduceOnly: category === 'linear',
-          isSpotMargin: this.config.marketType === 'spot_margin',
-        });
+        await placeBybitOrder(
+          {
+            category,
+            symbol: pos.symbol,
+            side: pos.side === 'LONG' ? 'Sell' : 'Buy',
+            orderType: 'Market',
+            qtyBase: pos.qty,
+            reduceOnly: category === 'linear',
+            isSpotMargin: this.config.marketType === 'spot_margin',
+          },
+          this.privateEnv
+        );
         this.activePositions = this.activePositions.filter((p) => p.id !== positionId);
         this.recordClosedTrade(pos, exitPrice, reason, false);
         await this.syncExchangeState();
@@ -1179,8 +1217,11 @@ class ServerBotDaemon {
     }
   }
 
-  public async setExecutionMode(mode: ExecutionMode): Promise<{ ok: boolean; error?: string }> {
-    const envCfg = getBybitEnvConfig();
+  public async setExecutionMode(
+    mode: ExecutionMode,
+    targetEnv?: PrivateEnv,
+    confirmLive = false
+  ): Promise<{ ok: boolean; error?: string }> {
     if (mode === 'paper') {
       this.executionMode = 'paper';
       this.activePositions = [];
@@ -1194,28 +1235,58 @@ class ServerBotDaemon {
       return { ok: true };
     }
 
+    const nextEnv: PrivateEnv = targetEnv ?? this.privateEnv;
+    const envCfg = getBybitEnvConfig(nextEnv);
+
+    if (nextEnv === 'mainnet' && !confirmLive) {
+      return {
+        ok: false,
+        error: 'Wymagane potwierdzenie uruchomienia handlu na prawdziwym koncie Bybit REAL (Mainnet).',
+      };
+    }
+
     if (!envCfg.configured) {
-      const error =
-        'Brak kluczy BYBIT_API_KEY / BYBIT_API_SECRET w zmiennych środowiskowych serwera.';
+      const varsHint =
+        nextEnv === 'mainnet'
+          ? 'BYBIT_LIVE_API_KEY oraz BYBIT_LIVE_API_SECRET'
+          : 'BYBIT_DEMO_API_KEY oraz BYBIT_DEMO_API_SECRET (lub BYBIT_API_KEY / BYBIT_API_SECRET)';
+      const error = `Brak kluczy ${varsHint} w zmiennych środowiskowych serwera (Railway Variables).`;
       this.pushEvent({
         category: 'WARNING',
         tag: 'BRAK KLUCZY',
-        message: `Próba włączenia trybu Bybit ${envCfg.env.toUpperCase()} odrzucona — brak kluczy API na serwerze.`,
+        message: `Próba włączenia trybu Bybit ${nextEnv === 'mainnet' ? 'REAL LIVE' : nextEnv.toUpperCase()} odrzucona — brak kluczy API na serwerze.`,
       });
       return { ok: false, error };
     }
 
+    const envChanged = this.privateEnv !== nextEnv;
+    this.privateEnv = nextEnv;
     this.executionMode = 'exchange';
     this.activePositions = [];
     this.pendingOrders = [];
-    const synced = await this.syncExchangeState();
+    if (envChanged) {
+      this.exchangeClosedTrades = [];
+      this.orderMetaBySymbol = {};
+      this.lastClosedPnlSyncAt = 0;
+      this.privateAccount = {
+        equity: 0,
+        availableBalance: 0,
+        walletBalance: 0,
+        unrealizedPnl: 0,
+        updatedAt: null,
+        error: null,
+      };
+    }
+
+    const synced = await this.syncExchangeState(true);
+    const label = nextEnv === 'mainnet' ? 'BYBIT REAL LIVE' : `BYBIT ${nextEnv.toUpperCase()}`;
     this.pushEvent({
-      category: 'SYSTEM',
-      tag: `BYBIT ${envCfg.env.toUpperCase()}`,
+      category: nextEnv === 'mainnet' ? 'WARNING' : 'SYSTEM',
+      tag: label,
       badgeText: envCfg.keyMask ?? undefined,
       message: synced
-        ? `Połączono silnik 24/7 z kontem Bybit ${envCfg.env.toUpperCase()} (${envCfg.privateBaseUrl}).`
-        : `Przełączono na Bybit ${envCfg.env.toUpperCase()}, ale wystąpił błąd odczytu konta.`,
+        ? `Połączono silnik 24/7 z kontem ${label} (${envCfg.privateBaseUrl}).`
+        : `Przełączono na ${label}, ale wystąpił błąd odczytu konta.`,
     });
     this.schedulePersist();
     return { ok: synced, error: synced ? undefined : this.privateAccount.error || undefined };
@@ -1250,16 +1321,17 @@ class ServerBotDaemon {
     this.botState = 'HALTED';
     if (this.executionMode === 'exchange') {
       try {
-        const res = await triggerBybitKillSwitch();
+        const res = await triggerBybitKillSwitch(this.privateEnv);
         this.pendingOrders = [];
         this.activePositions = [];
-        const msg = `Awaryjne zatrzymanie Bybit! Zamknięto pozycji: ${res.closed.length}, anulowano (${res.cancelled.join(', ') || 'brak'}).`;
+        const envLabel = this.privateEnv === 'mainnet' ? 'Bybit REAL LIVE' : `Bybit ${this.privateEnv.toUpperCase()}`;
+        const msg = `Awaryjne zatrzymanie ${envLabel}! Zamknięto pozycji: ${res.closed.length}, anulowano (${res.cancelled.join(', ') || 'brak'}).`;
         this.pushEvent({
           category: 'WARNING',
           tag: 'KILL SWITCH BYBIT',
           message: msg,
         });
-        await this.syncExchangeState();
+        await this.syncExchangeState(true);
         this.schedulePersist();
         return { ok: true, message: msg };
       } catch (err) {
@@ -1344,12 +1416,13 @@ class ServerBotDaemon {
   }
 
   public getSnapshot() {
-    const envCfg = getBybitEnvConfig();
+    const envCfg = getBybitEnvConfig(this.privateEnv);
     const privateStatus: PrivateExchangeStatus = {
       configured: envCfg.configured,
       env: envCfg.env,
       baseUrl: envCfg.privateBaseUrl,
       keyMask: envCfg.keyMask,
+      accounts: getAllBybitAccountsStatus(),
     };
 
     const equity = this.getEffectiveEquity();

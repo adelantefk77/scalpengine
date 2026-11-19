@@ -18,11 +18,21 @@ export type BotRunState = 'RUNNING' | 'PAUSED' | 'HALTED';
 export type ExecutionMode = 'paper' | 'exchange';
 export type PrivateEnv = 'demo' | 'testnet' | 'mainnet';
 
+export interface BybitAccountSlotStatus {
+  configured: boolean;
+  baseUrl: string;
+  keyMask: string | null;
+}
+
 export interface PrivateExchangeStatus {
   configured: boolean;
   env: PrivateEnv;
   baseUrl: string;
   keyMask: string | null;
+  accounts: {
+    demo: BybitAccountSlotStatus;
+    mainnet: BybitAccountSlotStatus;
+  };
 }
 
 export interface PrivateAccountSnapshot {

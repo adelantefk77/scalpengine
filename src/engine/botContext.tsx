@@ -13,6 +13,7 @@ import {
   PairTelemetry,
   PendingOrder,
   PrivateAccountSnapshot,
+  PrivateEnv,
   PrivateExchangeStatus,
   StrategyConfig,
   formatBybitSymbol,
@@ -78,7 +79,15 @@ interface BotContextValue {
   updateConfig: (next: StrategyConfig, logMessage?: string) => void;
   botState: BotRunState;
   executionMode: ExecutionMode;
-  setExecutionMode: (mode: ExecutionMode) => Promise<void>;
+  setExecutionMode: (mode: ExecutionMode, env?: PrivateEnv, confirmLive?: boolean) => Promise<boolean>;
+  testBybitAccount: (env: PrivateEnv) => Promise<{
+    ok: boolean;
+    env: PrivateEnv;
+    baseUrl?: string;
+    equity?: number;
+    availableBalance?: number;
+    error?: string;
+  }>;
   privateStatus: PrivateExchangeStatus;
   privateAccount: PrivateAccountSnapshot;
   serverStartedAt: number | null;
@@ -130,6 +139,10 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     env: 'demo',
     baseUrl: 'https://api-demo.bybit.com',
     keyMask: null,
+    accounts: {
+      demo: { configured: false, baseUrl: 'https://api-demo.bybit.com', keyMask: null },
+      mainnet: { configured: false, baseUrl: 'https://api.bybit.com', keyMask: null },
+    },
   });
   const [privateAccount, setPrivateAccount] = useState<PrivateAccountSnapshot>({
     equity: 0,
@@ -624,44 +637,79 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const setExecutionMode = useCallback(
-    async (mode: ExecutionMode) => {
+    async (mode: ExecutionMode, env?: PrivateEnv, confirmLive = false): Promise<boolean> => {
       try {
         const res = await fetch('/api/bot/mode', {
           method: 'POST',
+          credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode }),
+          body: JSON.stringify({ mode, env, confirmLive }),
         });
         const data = (await res.json()) as DaemonSnapshotResponse;
         applyDaemonSnapshot(data);
         if (!res.ok || !data.ok) {
           showToast(
             data.error ||
-              'Brak kluczy BYBIT_API_KEY / BYBIT_API_SECRET w zmiennych środowiskowych serwera.',
+              'Brak kluczy API dla wybranego środowiska w zmiennych środowiskowych serwera.',
             'error'
           );
-          return;
+          return false;
         }
-        const envUpper = (data.privateStatus?.env || 'demo').toUpperCase();
+        const activeEnv = data.privateStatus?.env || env || 'demo';
+        const envLabel = activeEnv === 'mainnet' ? 'REAL LIVE' : activeEnv.toUpperCase();
         showToast(
           mode === 'exchange'
-            ? `Silnik 24/7 przełączony na Bybit ${envUpper} (${data.privateStatus?.baseUrl}).`
+            ? `Silnik 24/7 przełączony na Bybit ${envLabel} (${data.privateStatus?.baseUrl}).`
             : 'Silnik 24/7 przełączony na tryb Paper Trading.',
-          'success'
+          activeEnv === 'mainnet' && mode === 'exchange' ? 'warning' : 'success'
         );
+        return true;
       } catch (err) {
         showToast(
           `Błąd zmiany trybu: ${err instanceof Error ? err.message : 'Network error'}`,
           'error'
         );
+        return false;
       }
     },
     [applyDaemonSnapshot, showToast]
   );
 
+  const testBybitAccount = useCallback(async (env: PrivateEnv) => {
+    try {
+      const res = await fetch(`/api/bybit/private/account?env=${encodeURIComponent(env)}`, {
+        credentials: 'include',
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        env?: PrivateEnv;
+        baseUrl?: string;
+        equity?: number;
+        availableBalance?: number;
+        error?: string;
+      };
+      return {
+        ok: Boolean(res.ok && data.ok),
+        env: data.env || env,
+        baseUrl: data.baseUrl,
+        equity: data.equity,
+        availableBalance: data.availableBalance,
+        error: data.error,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        env,
+        error: err instanceof Error ? err.message : 'Network error',
+      };
+    }
+  }, []);
+
   const refreshPrivateAccount = useCallback(async () => {
     try {
       const res = await fetch('/api/bot/control', {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'refresh_private' }),
       });
@@ -850,6 +898,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     botState,
     executionMode,
     setExecutionMode,
+    testBybitAccount,
     privateStatus,
     privateAccount,
     serverStartedAt,

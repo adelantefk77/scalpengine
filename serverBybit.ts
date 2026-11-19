@@ -24,10 +24,60 @@ export interface BybitNetworkDiagnostics {
   blockedHosts: string[];
 }
 
-export function getBybitEnvConfig(): BybitEnvConfig {
-  const rawEnv = String(process.env.BYBIT_ENV || 'demo').toLowerCase();
-  const env: BybitEnv =
-    rawEnv === 'mainnet' ? 'mainnet' : rawEnv === 'testnet' ? 'testnet' : 'demo';
+export function getDefaultBybitEnv(): BybitEnv {
+  const rawEnv = String(process.env.BYBIT_ENV || 'demo').toLowerCase().trim();
+  if (rawEnv === 'mainnet' || rawEnv === 'live' || rawEnv === 'real') return 'mainnet';
+  if (rawEnv === 'testnet') return 'testnet';
+  return 'demo';
+}
+
+function resolveEnvCredentials(env: BybitEnv): { apiKey: string; apiSecret: string } {
+  const defaultEnv = getDefaultBybitEnv();
+  const legacyKey = (process.env.BYBIT_API_KEY || '').trim();
+  const legacySecret = (process.env.BYBIT_API_SECRET || '').trim();
+
+  if (env === 'mainnet') {
+    const apiKey = (
+      process.env.BYBIT_LIVE_API_KEY ||
+      process.env.BYBIT_MAINNET_API_KEY ||
+      process.env.BYBIT_REAL_API_KEY ||
+      (defaultEnv === 'mainnet' ? legacyKey : '')
+    ).trim();
+    const apiSecret = (
+      process.env.BYBIT_LIVE_API_SECRET ||
+      process.env.BYBIT_MAINNET_API_SECRET ||
+      process.env.BYBIT_REAL_API_SECRET ||
+      (defaultEnv === 'mainnet' ? legacySecret : '')
+    ).trim();
+    return { apiKey, apiSecret };
+  }
+
+  if (env === 'testnet') {
+    const apiKey = (
+      process.env.BYBIT_TESTNET_API_KEY ||
+      (defaultEnv === 'testnet' ? legacyKey : '')
+    ).trim();
+    const apiSecret = (
+      process.env.BYBIT_TESTNET_API_SECRET ||
+      (defaultEnv === 'testnet' ? legacySecret : '')
+    ).trim();
+    return { apiKey, apiSecret };
+  }
+
+  // demo
+  const apiKey = (
+    process.env.BYBIT_DEMO_API_KEY ||
+    (defaultEnv === 'demo' ? legacyKey : '')
+  ).trim();
+  const apiSecret = (
+    process.env.BYBIT_DEMO_API_SECRET ||
+    (defaultEnv === 'demo' ? legacySecret : '')
+  ).trim();
+  return { apiKey, apiSecret };
+}
+
+export function getBybitEnvConfig(envOverride?: BybitEnv): BybitEnvConfig {
+  const env: BybitEnv = envOverride ?? getDefaultBybitEnv();
 
   const privateBaseUrl =
     env === 'demo'
@@ -36,8 +86,7 @@ export function getBybitEnvConfig(): BybitEnvConfig {
         ? 'https://api-testnet.bybit.com'
         : 'https://api.bybit.com';
 
-  const apiKey = (process.env.BYBIT_API_KEY || '').trim();
-  const apiSecret = (process.env.BYBIT_API_SECRET || '').trim();
+  const { apiKey, apiSecret } = resolveEnvCredentials(env);
   const configured = apiKey.length > 0 && apiSecret.length > 0;
   const keyMask = configured ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}` : null;
 
@@ -48,6 +97,23 @@ export function getBybitEnvConfig(): BybitEnvConfig {
     apiSecret,
     configured,
     keyMask,
+  };
+}
+
+export function getAllBybitAccountsStatus() {
+  const demo = getBybitEnvConfig('demo');
+  const mainnet = getBybitEnvConfig('mainnet');
+  return {
+    demo: {
+      configured: demo.configured,
+      baseUrl: demo.privateBaseUrl,
+      keyMask: demo.keyMask,
+    },
+    mainnet: {
+      configured: mainnet.configured,
+      baseUrl: mainnet.privateBaseUrl,
+      keyMask: mainnet.keyMask,
+    },
   };
 }
 
@@ -205,11 +271,16 @@ export async function fetchBybitJson<T>(
 export async function signedBybitRequest<T>(
   method: 'GET' | 'POST',
   apiPath: string,
-  params: Record<string, unknown> = {}
+  params: Record<string, unknown> = {},
+  targetEnv?: BybitEnv
 ): Promise<T> {
-  const cfg = getBybitEnvConfig();
+  const cfg = getBybitEnvConfig(targetEnv);
   if (!cfg.configured) {
-    throw new Error('Brak kluczy BYBIT_API_KEY / BYBIT_API_SECRET w zmiennych środowiskowych (.env).');
+    const varHint =
+      cfg.env === 'mainnet'
+        ? 'BYBIT_LIVE_API_KEY / BYBIT_LIVE_API_SECRET'
+        : 'BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET (lub BYBIT_API_KEY / BYBIT_API_SECRET)';
+    throw new Error(`Brak kluczy ${varHint} w zmiennych środowiskowych serwera.`);
   }
 
   const timestamp = Date.now().toString();
@@ -360,7 +431,10 @@ export interface PrivateOrderPayload {
   reduceOnly?: boolean;
 }
 
-export async function placeBybitOrder(body: PrivateOrderPayload): Promise<{
+export async function placeBybitOrder(
+  body: PrivateOrderPayload,
+  targetEnv?: BybitEnv
+): Promise<{
   orderId?: string;
   orderLinkId?: string;
   symbol: string;
@@ -394,12 +468,17 @@ export async function placeBybitOrder(body: PrivateOrderPayload): Promise<{
 
   if (category === 'linear' && !reduceOnly && leverage && leverage >= 1) {
     try {
-      await signedBybitRequest('POST', '/v5/position/set-leverage', {
-        category: 'linear',
-        symbol,
-        buyLeverage: String(leverage),
-        sellLeverage: String(leverage),
-      });
+      await signedBybitRequest(
+        'POST',
+        '/v5/position/set-leverage',
+        {
+          category: 'linear',
+          symbol,
+          buyLeverage: String(leverage),
+          sellLeverage: String(leverage),
+        },
+        targetEnv
+      );
     } catch (levErr) {
       const msg = levErr instanceof Error ? levErr.message : '';
       if (!msg.includes('110043')) {
@@ -468,7 +547,7 @@ export async function placeBybitOrder(body: PrivateOrderPayload): Promise<{
 
   const createRes = await signedBybitRequest<{
     result?: { orderId?: string; orderLinkId?: string };
-  }>('POST', '/v5/order/create', orderPayload);
+  }>('POST', '/v5/order/create', orderPayload, targetEnv);
 
   return {
     orderId: createRes.result?.orderId,
@@ -482,7 +561,7 @@ export async function placeBybitOrder(body: PrivateOrderPayload): Promise<{
   };
 }
 
-export async function fetchBybitPrivateAccount(): Promise<{
+export async function fetchBybitPrivateAccount(targetEnv?: BybitEnv): Promise<{
   equity: number;
   availableBalance: number;
   walletBalance: number;
@@ -499,7 +578,7 @@ export async function fetchBybitPrivateAccount(): Promise<{
         coin?: Array<Record<string, string>>;
       }>;
     };
-  }>('GET', '/v5/account/wallet-balance', { accountType: 'UNIFIED' });
+  }>('GET', '/v5/account/wallet-balance', { accountType: 'UNIFIED' }, targetEnv);
 
   const acct = data.result?.list?.[0];
   return {
@@ -526,36 +605,54 @@ export interface RawBybitOrder {
   stopLoss?: string;
 }
 
-export async function fetchBybitPrivateState(category: 'spot' | 'linear'): Promise<{
+export async function fetchBybitPrivateState(
+  category: 'spot' | 'linear',
+  targetEnv?: BybitEnv
+): Promise<{
   orders: RawBybitOrder[];
   positions: Array<Record<string, string>>;
 }> {
   const [ordersSettled, positionsSettled] = await Promise.all([
     category === 'linear'
       ? Promise.allSettled([
-          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>('GET', '/v5/order/realtime', {
-            category: 'linear',
-            settleCoin: 'USDT',
-          }),
-          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>('GET', '/v5/order/realtime', {
-            category: 'linear',
-            settleCoin: 'USDC',
-          }),
+          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>(
+            'GET',
+            '/v5/order/realtime',
+            {
+              category: 'linear',
+              settleCoin: 'USDT',
+            },
+            targetEnv
+          ),
+          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>(
+            'GET',
+            '/v5/order/realtime',
+            {
+              category: 'linear',
+              settleCoin: 'USDC',
+            },
+            targetEnv
+          ),
         ])
       : Promise.allSettled([
-          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>('GET', '/v5/order/realtime', {
-            category: 'spot',
-            openOnly: 0,
-          }),
+          signedBybitRequest<{ result?: { list?: RawBybitOrder[] } }>(
+            'GET',
+            '/v5/order/realtime',
+            {
+              category: 'spot',
+              openOnly: 0,
+            },
+            targetEnv
+          ),
         ]),
     category === 'linear'
       ? Promise.allSettled([
           signedBybitRequest<{
             result?: { list?: Array<Record<string, string>> };
-          }>('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDT' }),
+          }>('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDT' }, targetEnv),
           signedBybitRequest<{
             result?: { list?: Array<Record<string, string>> };
-          }>('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDC' }),
+          }>('GET', '/v5/position/list', { category: 'linear', settleCoin: 'USDC' }, targetEnv),
         ])
       : Promise.resolve([]),
   ]);
@@ -595,16 +692,22 @@ export async function fetchBybitPrivateState(category: 'spot' | 'linear'): Promi
 export async function cancelBybitOrder(
   category: 'spot' | 'linear',
   symbol: string,
-  orderId: string
+  orderId: string,
+  targetEnv?: BybitEnv
 ): Promise<unknown> {
-  return signedBybitRequest('POST', '/v5/order/cancel', {
-    category,
-    symbol,
-    orderId,
-  });
+  return signedBybitRequest(
+    'POST',
+    '/v5/order/cancel',
+    {
+      category,
+      symbol,
+      orderId,
+    },
+    targetEnv
+  );
 }
 
-export async function triggerBybitKillSwitch(): Promise<{
+export async function triggerBybitKillSwitch(targetEnv?: BybitEnv): Promise<{
   cancelled: string[];
   closed: string[];
 }> {
@@ -617,7 +720,7 @@ export async function triggerBybitKillSwitch(): Promise<{
     { category: 'spot' },
   ]) {
     try {
-      await signedBybitRequest('POST', '/v5/order/cancel-all', reqParams);
+      await signedBybitRequest('POST', '/v5/order/cancel-all', reqParams, targetEnv);
       cancelled.push(reqParams.category + (reqParams.settleCoin ? `:${reqParams.settleCoin}` : ''));
     } catch {
       // ignore empty categories
@@ -628,22 +731,27 @@ export async function triggerBybitKillSwitch(): Promise<{
     try {
       const posRes = await signedBybitRequest<{
         result?: { list?: Array<Record<string, string>> };
-      }>('GET', '/v5/position/list', { category: 'linear', settleCoin });
+      }>('GET', '/v5/position/list', { category: 'linear', settleCoin }, targetEnv);
 
       const list = posRes.result?.list ?? [];
       for (const pos of list) {
         const size = Number(pos.size || 0);
         if (size <= 0) continue;
         const closeSide = pos.side === 'Buy' ? 'Sell' : 'Buy';
-        await signedBybitRequest('POST', '/v5/order/create', {
-          category: 'linear',
-          symbol: pos.symbol,
-          side: closeSide,
-          orderType: 'Market',
-          qty: pos.size,
-          reduceOnly: true,
-          timeInForce: 'IOC',
-        });
+        await signedBybitRequest(
+          'POST',
+          '/v5/order/create',
+          {
+            category: 'linear',
+            symbol: pos.symbol,
+            side: closeSide,
+            orderType: 'Market',
+            qty: pos.size,
+            reduceOnly: true,
+            timeInForce: 'IOC',
+          },
+          targetEnv
+        );
         closed.push(`${pos.symbol} (${pos.size})`);
       }
     } catch {
@@ -676,7 +784,10 @@ export interface RawBybitClosedPnl {
   updatedTime: string;
 }
 
-export async function fetchBybitClosedPnl(days = 28): Promise<RawBybitClosedPnl[]> {
+export async function fetchBybitClosedPnl(
+  days = 28,
+  targetEnv?: BybitEnv
+): Promise<RawBybitClosedPnl[]> {
   const now = Date.now();
   const weekMs = 7 * 24 * 60 * 60 * 1000 - 60_000;
   const weeks = Math.max(1, Math.min(8, Math.ceil(days / 7)));
@@ -698,7 +809,8 @@ export async function fetchBybitClosedPnl(days = 28): Promise<RawBybitClosedPnl[
           startTime: win.startTime,
           endTime: win.endTime,
           limit: 100,
-        }
+        },
+        targetEnv
       )
     )
   );
