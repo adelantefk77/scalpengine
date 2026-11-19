@@ -227,25 +227,25 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       {/* Main Content Shell */}
       <div className="lg:pl-64 flex-1 flex flex-col min-h-screen w-full">
         {/* Top Fixed Header */}
-        <header className="fixed top-0 left-0 lg:left-64 right-0 h-16 bg-surface/90 backdrop-blur-xl z-30 px-4 lg:px-5 border-b border-white/5 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5 min-w-0">
+        <header className="fixed top-0 left-0 lg:left-64 right-0 h-16 bg-surface/90 backdrop-blur-xl z-30 px-3 lg:px-4 border-b border-white/5 flex items-center justify-between gap-2 overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0 shrink">
             <button
               type="button"
               onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden p-2 rounded-lg bg-surface-container-high text-on-surface hover:bg-surface-container-highest"
+              className="lg:hidden p-2 rounded-lg bg-surface-container-high text-on-surface hover:bg-surface-container-highest shrink-0"
               aria-label="Otwórz menu"
             >
               <Menu className="w-5 h-5" />
             </button>
 
-            <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-container-high whitespace-nowrap shrink-0">
+            <div className="hidden xl:flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-surface-container-high whitespace-nowrap shrink-0">
               <span className="h-2 w-2 rounded-full bg-primary-container" />
               <span className="font-mono text-[10px] uppercase tracking-wider text-on-surface font-bold">
                 {marketLabel}
               </span>
             </div>
 
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface-container-low whitespace-nowrap shrink-0">
+            <div className="hidden 2xl:flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-surface-container-low whitespace-nowrap shrink-0">
               <span
                 className={`h-2 w-2 rounded-full ${
                   wsStatus.connected ? 'bg-tertiary' : 'bg-primary-container'
@@ -259,7 +259,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               </span>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               {/* Execution Mode Switcher: Paper vs Bybit Demo vs Bybit REAL LIVE */}
               <div
                 className={`flex items-center p-0.5 rounded-lg bg-surface-container border shrink-0 ${
@@ -315,12 +315,14 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                           : 'bg-outline'
                     }`}
                   />
-                  <span>REAL LIVE</span>
+                  <span>
+                    REAL<span className="hidden 2xl:inline"> LIVE</span>
+                  </span>
                 </button>
               </div>
 
               <span
-                className={`px-2.5 py-1 rounded font-mono text-[10px] font-bold tracking-wider uppercase whitespace-nowrap ${
+                className={`hidden sm:inline-flex px-2 py-1 rounded font-mono text-[10px] font-bold tracking-wider uppercase whitespace-nowrap shrink-0 ${
                   botState === 'RUNNING'
                     ? 'bg-tertiary-container/15 text-tertiary'
                     : botState === 'PAUSED'
@@ -335,26 +337,28 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                 <button
                   type="button"
                   onClick={resumeFromKillSwitch}
-                  className="px-3 py-1.5 rounded-lg bg-tertiary text-on-tertiary hover:bg-tertiary-fixed font-sans text-xs font-bold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                  title="Wznów silnik"
+                  className="px-2.5 py-1.5 rounded-lg bg-tertiary text-on-tertiary hover:bg-tertiary-fixed font-sans text-xs font-bold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                 >
                   <Play className="w-3.5 h-3.5" />
-                  <span>Wznów silnik</span>
+                  <span className="hidden xl:inline">Wznów silnik</span>
                 </button>
               ) : (
                 <button
                   type="button"
                   onClick={togglePauseBot}
-                  className="px-3 py-1.5 rounded-lg bg-surface-container-high text-on-surface hover:bg-surface-container-highest font-sans text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                  title={botState === 'RUNNING' ? 'Pauza bota' : 'Wznów bota'}
+                  className="px-2.5 py-1.5 rounded-lg bg-surface-container-high text-on-surface hover:bg-surface-container-highest font-sans text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                 >
                   {botState === 'RUNNING' ? (
                     <>
                       <Pause className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">Pauza bota</span>
+                      <span className="hidden xl:inline">Pauza</span>
                     </>
                   ) : (
                     <>
                       <Play className="w-3.5 h-3.5 text-tertiary" />
-                      <span className="hidden sm:inline">Wznów bota</span>
+                      <span className="hidden xl:inline">Wznów</span>
                     </>
                   )}
                 </button>
@@ -363,16 +367,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
           </div>
 
           {/* Right Header Telemetry & Kill Switch */}
-          <div className="flex items-center gap-3 shrink-0">
-            <div className="hidden xl:flex items-center gap-1 px-2.5 py-1 rounded bg-surface-container font-mono text-[10px] text-on-surface-variant">
-              <span className={config.quoteCurrency === 'USDT' ? 'text-primary font-bold' : ''}>USDT</span>
-              <span>/</span>
-              <span className={config.quoteCurrency === 'USDC' ? 'text-primary font-bold' : ''}>USDC</span>
-              <span>/</span>
-              <span className={config.quoteCurrency === 'EURQ' ? 'text-primary font-bold' : ''}>EURQ</span>
-            </div>
-
-            <div className="flex items-center gap-3 px-3 py-1 rounded-lg bg-surface-container-low">
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-2.5 px-2.5 py-1 rounded-lg bg-surface-container-low whitespace-nowrap">
               <div className="flex flex-col">
                 <span className="font-mono text-[9px] text-on-surface-variant uppercase tracking-wider">
                   Equity
@@ -381,8 +377,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
                   {formatUsd(equity)}
                 </span>
               </div>
-              <div className="h-6 w-[1px] bg-surface-container-high hidden sm:block" />
-              <div className="hidden sm:flex flex-col">
+              <div className="h-6 w-[1px] bg-surface-container-high hidden md:block" />
+              <div className="hidden md:flex flex-col">
                 <span className="font-mono text-[9px] text-on-surface-variant uppercase tracking-wider">
                   Dzisiejszy PnL
                 </span>
@@ -400,7 +396,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
             <button
               type="button"
               onClick={() => setKillModalOpen(true)}
-              className="px-3.5 py-2 rounded-lg bg-error-container text-on-error-container hover:bg-error hover:text-on-error font-mono text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-[0_0_12px_rgba(246,70,93,0.3)] transition-all whitespace-nowrap shrink-0"
+              title="Awaryjne zatrzymanie (Kill Switch)"
+              className="px-2.5 sm:px-3 py-2 rounded-lg bg-error-container text-on-error-container hover:bg-error hover:text-on-error font-mono text-[11px] font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-[0_0_12px_rgba(246,70,93,0.3)] transition-all whitespace-nowrap shrink-0"
             >
               <AlertTriangle className="w-4 h-4" />
               <span className="hidden sm:inline">KILL SWITCH</span>
