@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local-only files
+bun.lock
+* 2.ts
+public/assets/aistudio/*.png
