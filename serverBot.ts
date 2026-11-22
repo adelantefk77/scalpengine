@@ -67,6 +67,7 @@ interface PersistedBotState {
   closedTrades: ClosedTrade[];
   events: BotEvent[];
   migratedAssets?: string[];
+  positionOpenedAtById?: Record<string, number>;
 }
 
 const DEFAULT_START_EQUITY = 25000;
@@ -106,6 +107,9 @@ class ServerBotDaemon {
   private lastAdxWarnByBase: Record<string, number> = {};
   private inFlightOrders = new Set<string>();
   private inFlightClosures = new Set<string>();
+  private positionOpenedAtById: Record<string, number> = {};
+  private positionIdxById: Record<string, number> = {};
+  private closeRetryAfterById: Record<string, number> = {};
   private orderMetaBySymbol: Record<
     string,
     {
@@ -115,6 +119,7 @@ class ServerBotDaemon {
       tpPrice: number;
       slPrice: number;
       expiresAt: number;
+      submittedAt: number;
     }
   > = {};
 
@@ -182,6 +187,9 @@ class ServerBotDaemon {
         if (Array.isArray(parsed.events)) {
           this.events = parsed.events.slice(0, 100);
         }
+        if (parsed.positionOpenedAtById && typeof parsed.positionOpenedAtById === 'object') {
+          this.positionOpenedAtById = { ...parsed.positionOpenedAtById };
+        }
         if (
           parsed.privateEnv === 'demo' ||
           parsed.privateEnv === 'mainnet' ||
@@ -224,6 +232,7 @@ class ServerBotDaemon {
           closedTrades: this.closedTrades.slice(0, 500),
           events: this.events.slice(0, 100),
           migratedAssets: this.migratedAssets,
+          positionOpenedAtById: this.positionOpenedAtById,
         };
         fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(payload), 'utf-8');
       } catch {
@@ -488,8 +497,13 @@ class ServerBotDaemon {
         };
       });
 
+      const nextOpenIds = new Set<string>();
       const nextPositions: ActivePosition[] = state.positions.map((p) => {
         const symbol = String(p.symbol || '');
+        const posId = `${symbol}-${p.side}`;
+        nextOpenIds.add(posId);
+        this.positionIdxById[posId] = Number(p.positionIdx || 0);
+
         const { base, displayPair, snapshot } = this.resolveSymbolDisplay(symbol);
         const meta = this.orderMetaBySymbol[symbol];
         const entryPrice = Number(p.avgPrice || p.entryPrice || 0);
@@ -499,16 +513,42 @@ class ServerBotDaemon {
         const leverage = Number(p.leverage || cfg.leverage || 1);
         const uPnlUsd = Number(p.unrealisedPnl || 0);
         const side: 'LONG' | 'SHORT' = p.side === 'Buy' ? 'LONG' : 'SHORT';
-        const tpPrice = Number(
-          p.takeProfit || meta?.tpPrice || (side === 'LONG' ? entryPrice * 1.003 : entryPrice * 0.997)
-        );
-        const slPrice = Number(
-          p.stopLoss || meta?.slPrice || (side === 'LONG' ? entryPrice * 0.995 : entryPrice * 1.005)
-        );
-        const openedAt = Number(p.updatedTime || p.createdTime || Date.now());
+        const rawTp = Number(p.takeProfit || 0);
+        const rawSl = Number(p.stopLoss || 0);
+        const tpPrice =
+          rawTp > 0
+            ? rawTp
+            : meta?.tpPrice && meta.tpPrice > 0
+              ? meta.tpPrice
+              : side === 'LONG'
+                ? entryPrice * 1.003
+                : entryPrice * 0.997;
+        const slPrice =
+          rawSl > 0
+            ? rawSl
+            : meta?.slPrice && meta.slPrice > 0
+              ? meta.slPrice
+              : side === 'LONG'
+                ? entryPrice * 0.995
+                : entryPrice * 1.005;
+
+        // Preserve true open timestamp locally so Bybit's 8h funding settlement (updatedTime) never resets the Time-Stop clock
+        let openedAt = this.positionOpenedAtById[posId];
+        if (!openedAt || !Number.isFinite(openedAt) || openedAt <= 0) {
+          const existingPos = this.activePositions.find((ap) => ap.id === posId);
+          if (existingPos && existingPos.openedAt > 0) {
+            openedAt = existingPos.openedAt;
+          } else if (meta?.submittedAt && Date.now() - meta.submittedAt < 6 * 3600_000) {
+            openedAt = meta.submittedAt;
+          } else {
+            openedAt = Number(p.updatedTime || p.createdTime || Date.now());
+          }
+          this.positionOpenedAtById[posId] = openedAt;
+          this.schedulePersist();
+        }
 
         return {
-          id: `${symbol}-${p.side}`,
+          id: posId,
           base,
           symbol,
           displayPair,
@@ -531,6 +571,15 @@ class ServerBotDaemon {
           unrealizedPnlPct: notionalUsd > 0 ? (uPnlUsd / notionalUsd) * 100 : 0,
         };
       });
+
+      // Clean up tracking maps for positions that are no longer open on Bybit
+      for (const trackedId of Object.keys(this.positionOpenedAtById)) {
+        if (!nextOpenIds.has(trackedId)) {
+          delete this.positionOpenedAtById[trackedId];
+          delete this.positionIdxById[trackedId];
+          delete this.closeRetryAfterById[trackedId];
+        }
+      }
 
       // Detect positions closed directly on Bybit (e.g. TP/SL hit)
       let positionDisappeared = false;
@@ -665,6 +714,7 @@ class ServerBotDaemon {
       tpPrice,
       slPrice,
       expiresAt: now + cfg.orderTtlSec * 1000,
+      submittedAt: now,
     };
 
     try {
@@ -809,13 +859,14 @@ class ServerBotDaemon {
         signalResults.push({ snapshot, status: evalRes.status });
       }
 
-      if (signalResults.length === 0) return;
-
-      // 4. Update active positions uPnL & check exits
+      // 4. Update active positions uPnL & ALWAYS enforce protective exits (SL, TP, Time-Stop)
+      // IMPORTANT: Exits must run even when botState === 'PAUSED' (e.g. Daily Loss Guard or manual pause)
+      // and even if kline signalResults is temporarily empty, so open positions are NEVER left unprotected!
       const nextPositions: ActivePosition[] = [];
       for (const pos of this.activePositions) {
         const snap = this.latestSignalsByBase[pos.base];
-        const markPrice = snap?.lastPrice ?? pos.markPrice;
+        const liveTickerPrice = this.tickersBySymbol[pos.symbol]?.lastPrice;
+        const markPrice = liveTickerPrice ?? snap?.lastPrice ?? pos.markPrice;
 
         let dynamicTp = pos.tpPrice;
         if (this.executionMode === 'paper' && cfg.tpMode === 'mean' && snap) {
@@ -833,32 +884,41 @@ class ServerBotDaemon {
         const uPnlUsd = grossU - pos.entryFeeUsd;
         const uPnlPct = pos.notionalUsd > 0 ? (uPnlUsd / pos.notionalUsd) * 100 : 0;
 
-        if (this.botState === 'RUNNING') {
-          const elapsedMin = (now - pos.openedAt) / 60000;
+        const elapsedMin = (now - pos.openedAt) / 60000;
+        const hitSl =
+          pos.slPrice > 0 &&
+          ((pos.side === 'LONG' && markPrice <= pos.slPrice) ||
+            (pos.side === 'SHORT' && markPrice >= pos.slPrice));
+        const hitTp =
+          dynamicTp > 0 &&
+          ((pos.side === 'LONG' && markPrice >= dynamicTp) ||
+            (pos.side === 'SHORT' && markPrice <= dynamicTp));
+        const hitTimeStop = elapsedMin >= pos.timeStopMinutes;
+
+        if (this.botState !== 'HALTED') {
           if (this.executionMode === 'paper') {
-            if (pos.side === 'LONG' && markPrice >= dynamicTp) {
+            if (hitTp) {
               this.recordClosedTrade(pos, dynamicTp, 'TP_HIT', cfg.postOnly);
               continue;
             }
-            if (pos.side === 'SHORT' && markPrice <= dynamicTp) {
-              this.recordClosedTrade(pos, dynamicTp, 'TP_HIT', cfg.postOnly);
-              continue;
-            }
-            if (pos.side === 'LONG' && markPrice <= pos.slPrice) {
+            if (hitSl) {
               this.recordClosedTrade(pos, markPrice, 'SL_HIT', false);
               continue;
             }
-            if (pos.side === 'SHORT' && markPrice >= pos.slPrice) {
-              this.recordClosedTrade(pos, markPrice, 'SL_HIT', false);
-              continue;
-            }
-            if (elapsedMin >= pos.timeStopMinutes) {
+            if (hitTimeStop) {
               this.recordClosedTrade(pos, markPrice, 'TIME_STOP', false);
               continue;
             }
           } else {
-            if (elapsedMin >= pos.timeStopMinutes && !this.inFlightClosures.has(pos.id)) {
-              void this.closePositionMarket(pos.id, 'TIME_STOP');
+            const retryAfter = this.closeRetryAfterById[pos.id] || 0;
+            if (!this.inFlightClosures.has(pos.id) && now >= retryAfter) {
+              if (hitSl) {
+                void this.closePositionMarket(pos.id, 'SL_HIT');
+              } else if (hitTp) {
+                void this.closePositionMarket(pos.id, 'TP_HIT');
+              } else if (hitTimeStop) {
+                void this.closePositionMarket(pos.id, 'TIME_STOP');
+              }
             }
           }
         }
@@ -873,6 +933,7 @@ class ServerBotDaemon {
       }
       this.activePositions = nextPositions;
 
+      if (signalResults.length === 0) return;
       if (this.botState !== 'RUNNING') return;
 
       // 5. Check Daily Max Loss Guard
@@ -1194,16 +1255,29 @@ class ServerBotDaemon {
             orderType: 'Market',
             qtyBase: pos.qty,
             reduceOnly: category === 'linear',
+            positionIdx: category === 'linear' ? (this.positionIdxById[positionId] ?? 0) : undefined,
             isSpotMargin: this.config.marketType === 'spot_margin',
           },
           this.privateEnv
         );
+        delete this.positionOpenedAtById[positionId];
+        delete this.positionIdxById[positionId];
+        delete this.closeRetryAfterById[positionId];
         this.activePositions = this.activePositions.filter((p) => p.id !== positionId);
         this.recordClosedTrade(pos, exitPrice, reason, false);
-        await this.syncExchangeState();
+        await this.syncExchangeState(true);
         return { ok: true };
       } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : 'Błąd zamykania pozycji na Bybit' };
+        const errMsg = err instanceof Error ? err.message : 'Błąd zamykania pozycji na Bybit';
+        this.closeRetryAfterById[positionId] = Date.now() + 15000;
+        this.pushEvent({
+          category: 'WARNING',
+          tag: 'BŁĄD ZAMYKANIA',
+          symbol: pos.displayPair,
+          badgeText: reason,
+          message: `${pos.displayPair} Nie udało się zamknąć pozycji (${reason}): ${errMsg}. Ponowię próbę za 15s.`,
+        });
+        return { ok: false, error: errMsg };
       } finally {
         this.inFlightClosures.delete(positionId);
       }
@@ -1282,6 +1356,9 @@ class ServerBotDaemon {
     if (envChanged) {
       this.exchangeClosedTrades = [];
       this.orderMetaBySymbol = {};
+      this.positionOpenedAtById = {};
+      this.positionIdxById = {};
+      this.closeRetryAfterById = {};
       this.lastClosedPnlSyncAt = 0;
       this.privateAccount = {
         equity: 0,

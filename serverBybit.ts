@@ -429,6 +429,7 @@ export interface PrivateOrderPayload {
   tpPrice?: number;
   slPrice?: number;
   reduceOnly?: boolean;
+  positionIdx?: number;
 }
 
 export async function placeBybitOrder(
@@ -458,6 +459,7 @@ export async function placeBybitOrder(
     tpPrice,
     slPrice,
     reduceOnly = false,
+    positionIdx,
   } = body;
 
   if (!symbol || !side) {
@@ -531,14 +533,22 @@ export async function placeBybitOrder(
   }
 
   if (category === 'linear') {
+    if (typeof positionIdx === 'number' && Number.isFinite(positionIdx)) {
+      orderPayload.positionIdx = positionIdx;
+    }
     if (reduceOnly) {
       orderPayload.reduceOnly = true;
     } else {
-      if (tpPrice && Number.isFinite(tpPrice) && tpPrice > 0) {
+      const hasTp = Boolean(tpPrice && Number.isFinite(tpPrice) && tpPrice > 0);
+      const hasSl = Boolean(slPrice && Number.isFinite(slPrice) && slPrice > 0);
+      if (hasTp || hasSl) {
+        orderPayload.tpslMode = 'Full';
+      }
+      if (hasTp && tpPrice) {
         orderPayload.takeProfit = roundToStep(tpPrice, filters.tickSize, 'round');
         orderPayload.tpTriggerBy = 'LastPrice';
       }
-      if (slPrice && Number.isFinite(slPrice) && slPrice > 0) {
+      if (hasSl && slPrice) {
         orderPayload.stopLoss = roundToStep(slPrice, filters.tickSize, 'round');
         orderPayload.slTriggerBy = 'LastPrice';
       }
@@ -748,6 +758,7 @@ export async function triggerBybitKillSwitch(targetEnv?: BybitEnv): Promise<{
             orderType: 'Market',
             qty: pos.size,
             reduceOnly: true,
+            positionIdx: Number(pos.positionIdx || 0),
             timeInForce: 'IOC',
           },
           targetEnv
