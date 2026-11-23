@@ -796,7 +796,7 @@ export interface RawBybitClosedPnl {
 }
 
 export async function fetchBybitClosedPnl(
-  days = 28,
+  days = 35,
   targetEnv?: BybitEnv
 ): Promise<RawBybitClosedPnl[]> {
   const now = Date.now();
@@ -810,27 +810,48 @@ export async function fetchBybitClosedPnl(
     windows.push({ startTime, endTime });
   }
 
-  const results = await Promise.allSettled(
-    windows.map((win) =>
-      signedBybitRequest<{ result?: { list?: RawBybitClosedPnl[] } }>(
-        'GET',
-        '/v5/position/closed-pnl',
-        {
-          category: 'linear',
-          startTime: win.startTime,
-          endTime: win.endTime,
-          limit: 100,
-        },
-        targetEnv
-      )
-    )
-  );
+  const fetchWindowAllPages = async (win: { startTime: number; endTime: number }): Promise<RawBybitClosedPnl[]> => {
+    const rows: RawBybitClosedPnl[] = [];
+    let cursor = '';
+    const seenCursors = new Set<string>();
+    const MAX_PAGES_PER_WINDOW = 25; // up to 2,500 closed trades per 7-day window
+
+    for (let page = 0; page < MAX_PAGES_PER_WINDOW; page++) {
+      const params: Record<string, string | number> = {
+        category: 'linear',
+        startTime: win.startTime,
+        endTime: win.endTime,
+        limit: 100,
+      };
+      if (cursor) {
+        params.cursor = cursor;
+      }
+
+      const res = await signedBybitRequest<{
+        result?: { list?: RawBybitClosedPnl[]; nextPageCursor?: string };
+      }>('GET', '/v5/position/closed-pnl', params, targetEnv);
+
+      const list = res.result?.list ?? [];
+      rows.push(...list);
+
+      const nextCursor = String(res.result?.nextPageCursor || '').trim();
+      if (!nextCursor || list.length === 0 || seenCursors.has(nextCursor)) {
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    return rows;
+  };
+
+  const results = await Promise.allSettled(windows.map((win) => fetchWindowAllPages(win)));
 
   const byId = new Map<string, RawBybitClosedPnl>();
   for (const res of results) {
     if (res.status !== 'fulfilled') continue;
-    for (const row of res.value.result?.list ?? []) {
-      const key = `${row.orderId}-${row.updatedTime}`;
+    for (const row of res.value) {
+      const key = `${row.orderId}-${row.updatedTime}-${row.closedSize}-${row.closedPnl}`;
       if (!byId.has(key)) {
         byId.set(key, row);
       }
@@ -841,4 +862,5 @@ export async function fetchBybitClosedPnl(
     (a, b) => Number(b.updatedTime || 0) - Number(a.updatedTime || 0)
   );
 }
+
 

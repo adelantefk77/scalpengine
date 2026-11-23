@@ -389,7 +389,7 @@ class ServerBotDaemon {
     };
 
     if (this.executionMode === 'exchange') {
-      this.exchangeClosedTrades = [closed, ...this.exchangeClosedTrades.slice(0, 499)];
+      this.exchangeClosedTrades = [closed, ...this.exchangeClosedTrades.slice(0, 4999)];
       this.lastClosedPnlSyncAt = 0;
     } else {
       this.closedTrades = [closed, ...this.closedTrades.slice(0, 499)];
@@ -601,13 +601,13 @@ class ServerBotDaemon {
       this.pendingOrders = nextOrders;
       this.activePositions = nextPositions;
 
-      // Sync authoritative Bybit realized closed-pnl history every 20s or right after a position closes
+      // Sync authoritative Bybit realized closed-pnl history every 45s or right after a position closes
       if (
         category === 'linear' &&
-        (forceClosedPnl || positionDisappeared || Date.now() - this.lastClosedPnlSyncAt >= 20000)
+        (forceClosedPnl || positionDisappeared || Date.now() - this.lastClosedPnlSyncAt >= 45000)
       ) {
         try {
-          const rawClosed = await fetchBybitClosedPnl(28, activeEnv);
+          const rawClosed = await fetchBybitClosedPnl(35, activeEnv);
           this.lastClosedPnlSyncAt = Date.now();
           const localHints = [...this.exchangeClosedTrades];
 
@@ -635,7 +635,7 @@ class ServerBotDaemon {
             );
 
             return {
-              id: `bybit-${row.orderId}-${row.updatedTime}`,
+              id: `bybit-${row.orderId}-${row.updatedTime}-${row.closedSize}`,
               base,
               symbol: row.symbol,
               displayPair,
@@ -673,7 +673,7 @@ class ServerBotDaemon {
 
           this.exchangeClosedTrades = [...recentUnmatched, ...mappedBybit]
             .sort((a, b) => b.closedAt - a.closedAt)
-            .slice(0, 500);
+            .slice(0, 5000);
         } catch {
           // keep cached exchangeClosedTrades on transient closed-pnl API error
         }
