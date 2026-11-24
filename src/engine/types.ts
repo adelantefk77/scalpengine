@@ -52,6 +52,7 @@ export interface StrategyConfig {
   activePairs: string[]; // base assets e.g. ['SOL', 'ETH', 'BTC', ...]
   pausedPairs: string[];
   postOnly: boolean;
+  makerTakeProfit: boolean;
   limitOffsetTicks: number;
   orderTtlSec: number;
   meanAnchor: MeanAnchor;
@@ -60,6 +61,10 @@ export interface StrategyConfig {
   rsiShortMin: number;
   adxMax: number;
   antiCrashAtrMult: number;
+  confirmCandleClose: boolean;
+  htfTrendFilter: boolean;
+  wickConfirmFilter: boolean;
+  minWickRatioPct: number;
   sizingMode: SizingMode;
   positionPercent: number;
   positionFixedUsd: number;
@@ -69,6 +74,7 @@ export interface StrategyConfig {
   slAtrMult: number;
   timeStopMinutes: number;
   maxConcurrentPositions: number;
+  maxSameSidePositions: number;
   dailyMaxLossPct: number;
   maxConsecutiveLosses: number;
   cooldownMinutes: number;
@@ -95,6 +101,8 @@ export interface IndicatorPoint {
   close: number;
   volume: number;
   ema20: number;
+  ema50: number;
+  ema100: number;
   vwap: number;
   anchor: number;
   stdDev: number;
@@ -116,6 +124,8 @@ export type SignalStatus =
   | 'NEAR_SHORT'
   | 'BLOCKED_ADX'
   | 'BLOCKED_ATR'
+  | 'BLOCKED_TREND'
+  | 'BLOCKED_WICK'
   | 'IN_POSITION_LONG'
   | 'IN_POSITION_SHORT'
   | 'PAUSED'
@@ -322,6 +332,7 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   activePairs: [...ALL_SCANNER_ASSETS],
   pausedPairs: [],
   postOnly: true,
+  makerTakeProfit: true,
   limitOffsetTicks: 5,
   orderTtlSec: 60,
   meanAnchor: 'ema20',
@@ -330,6 +341,10 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   rsiShortMin: 78,
   adxMax: 25.0,
   antiCrashAtrMult: 3.0,
+  confirmCandleClose: true,
+  htfTrendFilter: true,
+  wickConfirmFilter: true,
+  minWickRatioPct: 20,
   sizingMode: 'percent',
   positionPercent: 15,
   positionFixedUsd: 3500,
@@ -337,8 +352,9 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   tpMode: 'mean',
   tpAtrMult: 1.4,
   slAtrMult: 2.5,
-  timeStopMinutes: 30,
+  timeStopMinutes: 45,
   maxConcurrentPositions: 4,
+  maxSameSidePositions: 2,
   dailyMaxLossPct: 3.0,
   maxConsecutiveLosses: 3,
   cooldownMinutes: 60,
@@ -352,6 +368,11 @@ export const PRESET_CONFIGS: Record<PresetId, Partial<StrategyConfig>> = {
     preset: 'conservative',
     timeframe: '5',
     activePairs: ['SOL', 'ETH', 'BTC', 'NEAR', 'AVAX', 'SUI', 'DOGE', 'XRP', 'LINK', 'ENA'],
+    makerTakeProfit: true,
+    confirmCandleClose: true,
+    htfTrendFilter: true,
+    wickConfirmFilter: true,
+    minWickRatioPct: 25,
     limitOffsetTicks: 5,
     orderTtlSec: 90,
     zScoreThreshold: 2.35,
@@ -363,13 +384,19 @@ export const PRESET_CONFIGS: Record<PresetId, Partial<StrategyConfig>> = {
     positionPercent: 12,
     tpMode: 'mean',
     slAtrMult: 2.5,
-    timeStopMinutes: 30,
+    timeStopMinutes: 45,
     maxConcurrentPositions: 3,
+    maxSameSidePositions: 2,
   },
   balanced: {
     preset: 'balanced',
     timeframe: '5',
     activePairs: [...ALL_SCANNER_ASSETS],
+    makerTakeProfit: true,
+    confirmCandleClose: true,
+    htfTrendFilter: true,
+    wickConfirmFilter: true,
+    minWickRatioPct: 20,
     limitOffsetTicks: 5,
     orderTtlSec: 60,
     zScoreThreshold: 2.1,
@@ -381,13 +408,19 @@ export const PRESET_CONFIGS: Record<PresetId, Partial<StrategyConfig>> = {
     positionPercent: 15,
     tpMode: 'mean',
     slAtrMult: 2.5,
-    timeStopMinutes: 30,
+    timeStopMinutes: 45,
     maxConcurrentPositions: 4,
+    maxSameSidePositions: 2,
   },
   aggressive: {
     preset: 'aggressive',
     timeframe: '5',
     activePairs: [...ALL_SCANNER_ASSETS],
+    makerTakeProfit: true,
+    confirmCandleClose: true,
+    htfTrendFilter: false,
+    wickConfirmFilter: false,
+    minWickRatioPct: 15,
     limitOffsetTicks: 5,
     orderTtlSec: 60,
     zScoreThreshold: 2.1,
@@ -397,11 +430,12 @@ export const PRESET_CONFIGS: Record<PresetId, Partial<StrategyConfig>> = {
     antiCrashAtrMult: 3.2,
     leverage: 4,
     positionPercent: 15,
-    tpMode: 'atr',
+    tpMode: 'mean',
     tpAtrMult: 1.4,
     slAtrMult: 2.5,
-    timeStopMinutes: 30,
+    timeStopMinutes: 45,
     maxConcurrentPositions: 5,
+    maxSameSidePositions: 3,
   },
 };
 

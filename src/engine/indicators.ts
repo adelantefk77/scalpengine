@@ -190,6 +190,8 @@ export function buildIndicatorSeries(candles: Candle[], config: StrategyConfig):
 
   const closes = candles.map((c) => c.close);
   const ema20 = calcEMASeries(closes, 20);
+  const ema50 = calcEMASeries(closes, 50);
+  const ema100 = calcEMASeries(closes, 100);
   const vwap = calcSessionVWAPSeries(candles);
   const rsi7 = calcRSISeries(closes, 7);
   const atr14 = calcATRSeries(candles, 14);
@@ -222,6 +224,8 @@ export function buildIndicatorSeries(candles: Candle[], config: StrategyConfig):
       close: c.close,
       volume: c.volume,
       ema20: ema20[i],
+      ema50: ema50[i],
+      ema100: ema100[i],
       vwap: vwap[i],
       anchor,
       stdDev,
@@ -270,14 +274,63 @@ export function evaluatePointSignal(
     };
   }
 
-  // Entry signals
-  if (point.zScore <= -config.zScoreThreshold && point.rsi7 <= config.rsiLongMax) {
+  // Entry signals + optional HTF trend & rejection wick confirmation filters
+  const rawLong = point.zScore <= -config.zScoreThreshold && point.rsi7 <= config.rsiLongMax;
+  const rawShort = point.zScore >= config.zScoreThreshold && point.rsi7 >= config.rsiShortMin;
+
+  if (rawLong) {
+    if (
+      config.htfTrendFilter &&
+      point.ema50 > 0 &&
+      point.ema100 > 0 &&
+      point.ema50 < point.ema100 * 0.9985 &&
+      point.minusDi > point.plusDi + 6
+    ) {
+      return {
+        status: 'BLOCKED_TREND',
+        reason: `Filtr HTF: silny trend spadkowy (EMA50<EMA100, -DI ${point.minusDi.toFixed(0)} > +DI ${point.plusDi.toFixed(0)})`,
+      };
+    }
+    if (config.wickConfirmFilter) {
+      const minRatio = Math.max(0.05, Math.min(0.6, (config.minWickRatioPct || 20) / 100));
+      const range = Math.max(1e-9, point.high - point.low);
+      const lowerWickRatio = (Math.min(point.open, point.close) - point.low) / range;
+      if (lowerWickRatio < minRatio) {
+        return {
+          status: 'BLOCKED_WICK',
+          reason: `Brak dolnego knota odrzucenia (${(lowerWickRatio * 100).toFixed(0)}% < ${(minRatio * 100).toFixed(0)}%)`,
+        };
+      }
+    }
     return {
       status: 'SIGNAL_LONG',
       reason: `Z ${point.zScore.toFixed(2)}σ <= -${config.zScoreThreshold.toFixed(2)}σ & RSI ${point.rsi7.toFixed(1)}`,
     };
   }
-  if (point.zScore >= config.zScoreThreshold && point.rsi7 >= config.rsiShortMin) {
+  if (rawShort) {
+    if (
+      config.htfTrendFilter &&
+      point.ema50 > 0 &&
+      point.ema100 > 0 &&
+      point.ema50 > point.ema100 * 1.0015 &&
+      point.plusDi > point.minusDi + 6
+    ) {
+      return {
+        status: 'BLOCKED_TREND',
+        reason: `Filtr HTF: silny trend wzrostowy (EMA50>EMA100, +DI ${point.plusDi.toFixed(0)} > -DI ${point.minusDi.toFixed(0)})`,
+      };
+    }
+    if (config.wickConfirmFilter) {
+      const minRatio = Math.max(0.05, Math.min(0.6, (config.minWickRatioPct || 20) / 100));
+      const range = Math.max(1e-9, point.high - point.low);
+      const upperWickRatio = (point.high - Math.max(point.open, point.close)) / range;
+      if (upperWickRatio < minRatio) {
+        return {
+          status: 'BLOCKED_WICK',
+          reason: `Brak górnego knota odrzucenia (${(upperWickRatio * 100).toFixed(0)}% < ${(minRatio * 100).toFixed(0)}%)`,
+        };
+      }
+    }
     return {
       status: 'SIGNAL_SHORT',
       reason: `Z +${point.zScore.toFixed(2)}σ >= +${config.zScoreThreshold.toFixed(2)}σ & RSI ${point.rsi7.toFixed(1)}`,

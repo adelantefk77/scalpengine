@@ -231,7 +231,19 @@ export const BacktesterView: React.FC = () => {
           <span className="font-mono text-[11px] text-on-surface-variant tabular-nums">
             Interwał: <strong className="text-primary">{config.timeframe}m</strong> · Z-Score:{' '}
             <strong className="text-primary">±{config.zScoreThreshold.toFixed(2)}σ</strong> · ADX &lt;{' '}
-            <strong className="text-tertiary">{config.adxMax}</strong>
+            <strong className="text-tertiary">{config.adxMax}</strong> · TP:{' '}
+            <strong className="text-tertiary">{config.makerTakeProfit ? 'Maker' : 'Taker'}</strong>
+            {config.htfTrendFilter && (
+              <>
+                {' '}· <strong className="text-tertiary">HTF</strong>
+              </>
+            )}
+            {config.wickConfirmFilter && (
+              <>
+                {' '}· <strong className="text-tertiary">Knot≥{config.minWickRatioPct}%</strong>
+              </>
+            )}
+            {' '}· MaxDir: <strong className="text-primary">{config.maxSameSidePositions}</strong>
           </span>
         </div>
 

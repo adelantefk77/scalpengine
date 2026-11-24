@@ -710,6 +710,8 @@ export interface RawBybitOrder {
   createdTime: string;
   takeProfit?: string;
   stopLoss?: string;
+  reduceOnly?: boolean;
+  stopOrderType?: string;
 }
 
 export async function fetchBybitPrivateState(
@@ -812,6 +814,29 @@ export async function cancelBybitOrder(
     },
     targetEnv
   );
+}
+
+export async function amendBybitOrderPrice(
+  category: 'spot' | 'linear',
+  symbol: string,
+  orderId: string,
+  newPrice: number,
+  targetEnv?: BybitEnv
+): Promise<{ price: string }> {
+  const filters = await getInstrumentFilters(category, symbol);
+  const formattedPrice = roundToStep(newPrice, filters.tickSize, 'round');
+  await signedBybitRequest(
+    'POST',
+    '/v5/order/amend',
+    {
+      category,
+      symbol,
+      orderId,
+      price: formattedPrice,
+    },
+    targetEnv
+  );
+  return { price: formattedPrice };
 }
 
 export async function triggerBybitKillSwitch(targetEnv?: BybitEnv): Promise<{

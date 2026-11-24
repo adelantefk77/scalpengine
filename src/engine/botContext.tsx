@@ -602,7 +602,9 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       const openPos = activePositions.find((p) => p.base === base);
       const isPausedPair = config.pausedPairs.includes(base);
-      const evalRes = evaluatePointSignal(latest, config, {
+      const signalPoint =
+        config.confirmCandleClose && series.length >= 2 ? series[series.length - 2] : latest;
+      const evalRes = evaluatePointSignal(signalPoint, config, {
         isPausedPair,
         openSide: openPos?.side ?? null,
       });

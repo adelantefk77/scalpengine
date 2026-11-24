@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import {
+  amendBybitOrderPrice,
   cancelBybitOrder,
   fetchBybitClosedPnl,
   fetchBybitJson,
@@ -67,6 +68,7 @@ interface PersistedBotState {
   closedTrades: ClosedTrade[];
   events: BotEvent[];
   migratedAssets?: string[];
+  upgradedV2Execution?: boolean;
   positionOpenedAtById?: Record<string, number>;
   consecutiveLosses?: number;
   cooldownUntil?: number;
@@ -131,6 +133,10 @@ export function sanitizeStrategyConfig(
     clampNum(raw.rsiShortMin, fallback.rsiShortMin, Math.max(55, rsiLongMax + 10), 95)
   );
 
+  const maxConcurrentPositions = Math.round(
+    clampNum(raw.maxConcurrentPositions, fallback.maxConcurrentPositions, 1, 10)
+  );
+
   return {
     preset,
     marketType,
@@ -139,6 +145,8 @@ export function sanitizeStrategyConfig(
     activePairs: safeActivePairs,
     pausedPairs,
     postOnly: typeof raw.postOnly === 'boolean' ? raw.postOnly : fallback.postOnly,
+    makerTakeProfit:
+      typeof raw.makerTakeProfit === 'boolean' ? raw.makerTakeProfit : fallback.makerTakeProfit,
     limitOffsetTicks: clampNum(raw.limitOffsetTicks, fallback.limitOffsetTicks, 0, 15),
     orderTtlSec: Math.round(clampNum(raw.orderTtlSec, fallback.orderTtlSec, 5, 180)),
     meanAnchor,
@@ -147,6 +155,13 @@ export function sanitizeStrategyConfig(
     rsiShortMin,
     adxMax: Number(clampNum(raw.adxMax, fallback.adxMax, 10, 60).toFixed(1)),
     antiCrashAtrMult: Number(clampNum(raw.antiCrashAtrMult, fallback.antiCrashAtrMult, 1.5, 8.0).toFixed(1)),
+    confirmCandleClose:
+      typeof raw.confirmCandleClose === 'boolean' ? raw.confirmCandleClose : fallback.confirmCandleClose,
+    htfTrendFilter:
+      typeof raw.htfTrendFilter === 'boolean' ? raw.htfTrendFilter : fallback.htfTrendFilter,
+    wickConfirmFilter:
+      typeof raw.wickConfirmFilter === 'boolean' ? raw.wickConfirmFilter : fallback.wickConfirmFilter,
+    minWickRatioPct: Math.round(clampNum(raw.minWickRatioPct, fallback.minWickRatioPct, 5, 60)),
     sizingMode,
     positionPercent: Number(clampNum(raw.positionPercent, fallback.positionPercent, 1, 35).toFixed(1)),
     positionFixedUsd: Math.round(clampNum(raw.positionFixedUsd, fallback.positionFixedUsd, 10, 100000)),
@@ -155,8 +170,9 @@ export function sanitizeStrategyConfig(
     tpAtrMult: Number(clampNum(raw.tpAtrMult, fallback.tpAtrMult, 0.5, 6.0).toFixed(2)),
     slAtrMult: Number(clampNum(raw.slAtrMult, fallback.slAtrMult, 0.8, 5.0).toFixed(2)),
     timeStopMinutes: Math.round(clampNum(raw.timeStopMinutes, fallback.timeStopMinutes, 3, 120)),
-    maxConcurrentPositions: Math.round(
-      clampNum(raw.maxConcurrentPositions, fallback.maxConcurrentPositions, 1, 10)
+    maxConcurrentPositions,
+    maxSameSidePositions: Math.round(
+      clampNum(raw.maxSameSidePositions, fallback.maxSameSidePositions, 1, maxConcurrentPositions)
     ),
     dailyMaxLossPct: Number(clampNum(raw.dailyMaxLossPct, fallback.dailyMaxLossPct, 0.5, 25).toFixed(1)),
     maxConsecutiveLosses: Math.round(
@@ -182,6 +198,7 @@ class ServerBotDaemon {
   private exchangeClosedTrades: ClosedTrade[] = [];
   private events: BotEvent[] = [];
   private migratedAssets: string[] = [...NEW_RECOMMENDED_ASSETS];
+  private upgradedV2Execution = true;
 
   private privateAccount: PrivateAccountSnapshot = {
     equity: 0,
@@ -204,6 +221,12 @@ class ServerBotDaemon {
   private inFlightOrders = new Set<string>();
   private inFlightCancellations = new Set<string>();
   private inFlightClosures = new Set<string>();
+  private inFlightTpSync = new Set<string>();
+  private tpOrderByPosId: Record<
+    string,
+    { orderId: string; price: number; qtyStr: string; updatedAt: number }
+  > = {};
+  private tpSyncRetryAfterByPosId: Record<string, number> = {};
   private positionOpenedAtById: Record<string, number> = {};
   private positionIdxById: Record<string, number> = {};
   private positionRawSizeById: Record<string, string> = {};
@@ -273,6 +296,22 @@ class ServerBotDaemon {
             this.schedulePersist();
           }
           this.migratedAssets = Array.from(new Set([...prevMigrated, ...NEW_RECOMMENDED_ASSETS]));
+
+          // One-time gentle V2 execution upgrade (Package 1 + Package 2 defaults) for legacy saved configs
+          if (!parsed.upgradedV2Execution) {
+            this.config = {
+              ...this.config,
+              makerTakeProfit: true,
+              confirmCandleClose: true,
+              htfTrendFilter: true,
+              wickConfirmFilter: true,
+              minWickRatioPct: 20,
+              maxSameSidePositions: Math.min(this.config.maxConcurrentPositions, 2),
+              timeStopMinutes: this.config.timeStopMinutes === 30 ? 45 : this.config.timeStopMinutes,
+            };
+            this.upgradedV2Execution = true;
+            this.schedulePersist();
+          }
         }
         if (parsed.botState === 'RUNNING' || parsed.botState === 'PAUSED' || parsed.botState === 'HALTED') {
           this.botState = parsed.botState;
@@ -340,6 +379,7 @@ class ServerBotDaemon {
         closedTrades: this.closedTrades.slice(0, 500),
         events: this.events.slice(0, 100),
         migratedAssets: this.migratedAssets,
+        upgradedV2Execution: this.upgradedV2Execution,
         positionOpenedAtById: this.positionOpenedAtById,
         consecutiveLosses: this.consecutiveLosses,
         cooldownUntil: this.cooldownUntil,
@@ -597,7 +637,41 @@ class ServerBotDaemon {
         return true;
       }
 
-      const nextOrders: PendingOrder[] = state.orders.map((o) => {
+      const openPosKeySet = new Set<string>(
+        state.positions.map((p) => `${String(p.symbol || '')}-${String(p.side || '')}`)
+      );
+
+      // Separate resting reduceOnly Limit TP orders from entry PendingOrders
+      const nextTpMap: Record<
+        string,
+        { orderId: string; price: number; qtyStr: string; updatedAt: number }
+      > = {};
+      const entryOrdersRaw = state.orders.filter((o) => {
+        const isReduceOnlyLimit = Boolean(o.reduceOnly) && o.orderType === 'Limit';
+        if (!isReduceOnlyLimit) return true;
+        // A Sell reduceOnly order belongs to a Buy (LONG) position, and vice versa
+        const posSide = o.side === 'Sell' ? 'Buy' : 'Sell';
+        const posId = `${o.symbol}-${posSide}`;
+        if (openPosKeySet.has(posId)) {
+          const prev = this.tpOrderByPosId[posId];
+          nextTpMap[posId] = {
+            orderId: o.orderId,
+            price: Number(o.price || 0),
+            qtyStr: String(o.qty || ''),
+            updatedAt: prev?.orderId === o.orderId ? prev.updatedAt : Date.now(),
+          };
+        } else if (!this.inFlightCancellations.has(o.orderId)) {
+          // Orphaned reduceOnly TP order left after position closed -> cancel cleanly
+          this.inFlightCancellations.add(o.orderId);
+          void cancelBybitOrder(category, o.symbol, o.orderId, activeEnv)
+            .catch(() => {})
+            .finally(() => this.inFlightCancellations.delete(o.orderId));
+        }
+        return false;
+      });
+      this.tpOrderByPosId = nextTpMap;
+
+      const nextOrders: PendingOrder[] = entryOrdersRaw.map((o) => {
         const { base, displayPair, snapshot } = this.resolveSymbolDisplay(o.symbol);
         const meta = this.orderMetaBySymbol[o.symbol];
         const limitPrice = Number(o.price || snapshot?.lastPrice || 0);
@@ -645,14 +719,17 @@ class ServerBotDaemon {
         const side: 'LONG' | 'SHORT' = p.side === 'Buy' ? 'LONG' : 'SHORT';
         const rawTp = Number(p.takeProfit || 0);
         const rawSl = Number(p.stopLoss || 0);
+        const restingMakerTp = this.tpOrderByPosId[posId]?.price || 0;
         const tpPrice =
-          rawTp > 0
-            ? rawTp
-            : meta?.tpPrice && meta.tpPrice > 0
-              ? meta.tpPrice
-              : side === 'LONG'
-                ? entryPrice * 1.003
-                : entryPrice * 0.997;
+          restingMakerTp > 0
+            ? restingMakerTp
+            : rawTp > 0
+              ? rawTp
+              : meta?.tpPrice && meta.tpPrice > 0
+                ? meta.tpPrice
+                : side === 'LONG'
+                  ? entryPrice * 1.003
+                  : entryPrice * 0.997;
         const slPrice =
           rawSl > 0
             ? rawSl
@@ -709,10 +786,11 @@ class ServerBotDaemon {
           delete this.positionIdxById[trackedId];
           delete this.positionRawSizeById[trackedId];
           delete this.closeRetryAfterById[trackedId];
+          delete this.tpSyncRetryAfterByPosId[trackedId];
         }
       }
 
-      // Detect positions closed directly on Bybit (e.g. TP/SL hit)
+      // Detect positions closed directly on Bybit (e.g. Maker Limit TP or hardware SL hit)
       let positionDisappeared = false;
       for (const prevPos of this.activePositions) {
         const stillOpen = nextPositions.some(
@@ -725,7 +803,8 @@ class ServerBotDaemon {
           const tpDist = Math.abs(exitPrice - prevPos.tpPrice);
           const slDist = Math.abs(exitPrice - prevPos.slPrice);
           const inferredReason: ClosedTrade['exitReason'] = tpDist <= slDist ? 'TP_HIT' : 'SL_HIT';
-          this.recordClosedTrade(prevPos, exitPrice, inferredReason, false);
+          const isMakerExit = inferredReason === 'TP_HIT' && cfg.makerTakeProfit;
+          this.recordClosedTrade(prevPos, exitPrice, inferredReason, isMakerExit);
         }
       }
 
@@ -887,7 +966,9 @@ class ServerBotDaemon {
           postOnly: isManual ? true : cfg.postOnly,
           leverage: cfg.leverage,
           isSpotMargin: cfg.marketType === 'spot_margin',
-          tpPrice: category === 'linear' ? tpPrice : undefined,
+          // When makerTakeProfit is ON, TP is managed as a resting reduceOnly Limit Post-Only order (0.02% Maker fee)
+          // while hardware Stop Loss remains natively attached on Bybit for instant protection.
+          tpPrice: category === 'linear' && !cfg.makerTakeProfit ? tpPrice : undefined,
           slPrice: category === 'linear' ? slPrice : undefined,
         },
         activeEnv
@@ -914,6 +995,94 @@ class ServerBotDaemon {
       return { ok: false, error: errMsg };
     } finally {
       this.inFlightOrders.delete(s.symbol);
+    }
+  }
+
+  private async ensureExchangeMakerTpOrder(
+    pos: ActivePosition,
+    targetTpPrice: number,
+    liveBid: number,
+    liveAsk: number
+  ): Promise<void> {
+    if (this.executionMode !== 'exchange') return;
+    const category = resolveBybitCategory(this.config.marketType);
+    if (category !== 'linear') return;
+    if (this.inFlightTpSync.has(pos.id) || this.inFlightClosures.has(pos.id)) return;
+
+    const now = Date.now();
+    if (now < (this.tpSyncRetryAfterByPosId[pos.id] || 0)) return;
+    if (!Number.isFinite(targetTpPrice) || targetTpPrice <= 0) return;
+
+    // Ensure Post-Only limit price stays strictly passive on the book
+    let safeTpPrice = targetTpPrice;
+    if (pos.side === 'LONG' && liveAsk > 0 && safeTpPrice <= liveAsk) {
+      safeTpPrice = liveAsk * 1.0001;
+    } else if (pos.side === 'SHORT' && liveBid > 0 && safeTpPrice >= liveBid) {
+      safeTpPrice = liveBid * 0.9999;
+    }
+
+    const existing = this.tpOrderByPosId[pos.id];
+    const exactQtyStr = this.positionRawSizeById[pos.id];
+    if (existing) {
+      const priceDiffPct =
+        existing.price > 0 ? Math.abs(safeTpPrice - existing.price) / existing.price : 1;
+      const qtyChanged = Boolean(exactQtyStr && existing.qtyStr && existing.qtyStr !== exactQtyStr);
+      // Throttle amends to once per 12s and only if dynamic EMA20 shifted >= 0.05% (5 bps)
+      if (!qtyChanged && (priceDiffPct < 0.0005 || now - existing.updatedAt < 12000)) {
+        return;
+      }
+    }
+
+    this.inFlightTpSync.add(pos.id);
+    const activeEnv = this.privateEnv;
+    try {
+      if (existing && (!exactQtyStr || existing.qtyStr === exactQtyStr)) {
+        const amended = await amendBybitOrderPrice(
+          'linear',
+          pos.symbol,
+          existing.orderId,
+          safeTpPrice,
+          activeEnv
+        );
+        this.tpOrderByPosId[pos.id] = {
+          ...existing,
+          price: Number(amended.price || safeTpPrice),
+          updatedAt: Date.now(),
+        };
+      } else {
+        if (existing) {
+          await cancelBybitOrder('linear', pos.symbol, existing.orderId, activeEnv).catch(() => {});
+          delete this.tpOrderByPosId[pos.id];
+        }
+        const placed = await placeBybitOrder(
+          {
+            category: 'linear',
+            symbol: pos.symbol,
+            side: pos.side === 'LONG' ? 'Sell' : 'Buy',
+            orderType: 'Limit',
+            qtyBase: pos.qty,
+            exactQtyStr,
+            price: safeTpPrice,
+            postOnly: true,
+            reduceOnly: true,
+            positionIdx: this.positionIdxById[pos.id] ?? 0,
+          },
+          activeEnv
+        );
+        if (placed.orderId) {
+          this.tpOrderByPosId[pos.id] = {
+            orderId: placed.orderId,
+            price: Number(placed.price || safeTpPrice),
+            qtyStr: placed.qty,
+            updatedAt: Date.now(),
+          };
+        }
+      }
+    } catch {
+      // Back off 10s on Post-Only rejection or transient exchange error (fallback TP check protects profit)
+      this.tpSyncRetryAfterByPosId[pos.id] = Date.now() + 10000;
+    } finally {
+      this.inFlightTpSync.delete(pos.id);
     }
   }
 
@@ -1003,14 +1172,18 @@ class ServerBotDaemon {
         if (livePrice < lastCandle.low) lastCandle.low = livePrice;
         liveCandles[liveCandles.length - 1] = lastCandle;
 
-        const series: IndicatorPoint[] = buildIndicatorSeries(liveCandles, cfg);
-        const latest = series[series.length - 1];
-        if (!latest) continue;
+        // When confirmCandleClose is enabled, evaluate entry signals strictly on the last CLOSED candle
+        // to eliminate mid-candle repainting and falling-knife entries (matching Backtester semantics).
+        const evalCandles =
+          cfg.confirmCandleClose && candles.length >= 2 ? candles.slice(0, -1) : liveCandles;
+        const evalSeries: IndicatorPoint[] = buildIndicatorSeries(evalCandles, cfg);
+        const latestEval = evalSeries[evalSeries.length - 1];
+        if (!latestEval) continue;
 
         const bidPrice = ticker?.bidPrice ?? livePrice;
         const askPrice = ticker?.askPrice ?? livePrice;
         const openPos = this.activePositions.find((p) => p.base === base);
-        const evalRes = evaluatePointSignal(latest, cfg, {
+        const evalRes = evaluatePointSignal(latestEval, cfg, {
           isPausedPair: cfg.pausedPairs.includes(base),
           openSide: openPos?.side ?? null,
         });
@@ -1022,34 +1195,35 @@ class ServerBotDaemon {
           lastPrice: livePrice,
           bidPrice,
           askPrice,
-          zScore: latest.zScore,
-          rsi7: latest.rsi7,
-          adx14: latest.adx14,
-          atr14: latest.atr14,
-          ema20: latest.ema20,
-          vwap: latest.vwap,
-          lastBarTime: latest.time,
+          zScore: latestEval.zScore,
+          rsi7: latestEval.rsi7,
+          adx14: latestEval.adx14,
+          atr14: latestEval.atr14,
+          ema20: latestEval.ema20,
+          vwap: latestEval.vwap,
+          lastBarTime: latestEval.time,
         };
         this.latestSignalsByBase[base] = snapshot;
         signalResults.push({ snapshot, status: evalRes.status });
       }
 
-      // 4. Update active positions uPnL & ALWAYS enforce protective exits (SL, TP, Time-Stop)
+      // 4. Update active positions uPnL & ALWAYS enforce protective exits (SL, Dynamic Maker TP, Time-Stop)
       // IMPORTANT: Exits must run even when botState === 'PAUSED' (e.g. Daily Loss Guard or manual pause)
       // and even if kline signalResults is temporarily empty, so open positions are NEVER left unprotected!
       const nextPositions: ActivePosition[] = [];
       for (const pos of this.activePositions) {
         const snap = this.latestSignalsByBase[pos.base];
-        const liveTickerPrice = this.tickersBySymbol[pos.symbol]?.lastPrice;
-        const markPrice = liveTickerPrice ?? snap?.lastPrice ?? pos.markPrice;
+        const liveTicker = this.tickersBySymbol[pos.symbol];
+        const markPrice = liveTicker?.lastPrice ?? snap?.lastPrice ?? pos.markPrice;
 
+        // Dynamic Mean TP now runs consistently in BOTH Paper and Exchange modes
         let dynamicTp = pos.tpPrice;
-        if (this.executionMode === 'paper' && cfg.tpMode === 'mean' && snap) {
+        if (cfg.tpMode === 'mean' && snap) {
           const anchor = cfg.meanAnchor === 'vwap' ? snap.vwap : snap.ema20;
           dynamicTp =
             pos.side === 'LONG'
-              ? Math.max(pos.entryPrice * 1.0012, anchor)
-              : Math.min(pos.entryPrice * 0.9988, anchor);
+              ? Math.max(pos.entryPrice * 1.0015, anchor)
+              : Math.min(pos.entryPrice * 0.9985, anchor);
         }
 
         const grossU =
@@ -1074,7 +1248,7 @@ class ServerBotDaemon {
         if (this.botState !== 'HALTED') {
           if (this.executionMode === 'paper') {
             if (hitTp) {
-              this.recordClosedTrade(pos, dynamicTp, 'TP_HIT', cfg.postOnly);
+              this.recordClosedTrade(pos, dynamicTp, 'TP_HIT', cfg.makerTakeProfit);
               continue;
             }
             if (hitSl) {
@@ -1087,13 +1261,33 @@ class ServerBotDaemon {
             }
           } else {
             const retryAfter = this.closeRetryAfterById[pos.id] || 0;
+            const useMakerTp = category === 'linear' && cfg.makerTakeProfit;
+
+            if (useMakerTp && !hitSl && !hitTimeStop) {
+              void this.ensureExchangeMakerTpOrder(
+                pos,
+                dynamicTp,
+                liveTicker?.bidPrice ?? markPrice,
+                liveTicker?.askPrice ?? markPrice
+              );
+            }
+
             if (!this.inFlightClosures.has(pos.id) && now >= retryAfter) {
               if (hitSl) {
                 void this.closePositionMarket(pos.id, 'SL_HIT');
-              } else if (hitTp) {
-                void this.closePositionMarket(pos.id, 'TP_HIT');
               } else if (hitTimeStop) {
                 void this.closePositionMarket(pos.id, 'TIME_STOP');
+              } else if (hitTp) {
+                // If Maker TP Limit is resting on Bybit, allow it to fill as Maker (0.02%) unless price overshot > 0.12% without fill
+                const restingTp = this.tpOrderByPosId[pos.id];
+                const overshootFallback =
+                  !restingTp ||
+                  (pos.side === 'LONG'
+                    ? markPrice >= dynamicTp * 1.0012
+                    : markPrice <= dynamicTp * 0.9988);
+                if (!useMakerTp || overshootFallback) {
+                  void this.closePositionMarket(pos.id, 'TP_HIT');
+                }
               }
             }
           }
@@ -1234,8 +1428,16 @@ class ServerBotDaemon {
         if (status !== 'SIGNAL_LONG' && status !== 'SIGNAL_SHORT') continue;
         if (this.lastSignalBarByBase[base] === s.lastBarTime) continue;
 
-        this.lastSignalBarByBase[base] = s.lastBarTime;
         const side: 'LONG' | 'SHORT' = status === 'SIGNAL_LONG' ? 'LONG' : 'SHORT';
+
+        // Enforce maxSameSidePositions guard to prevent correlated same-direction loss clusters
+        const maxSameSide = Math.max(1, cfg.maxSameSidePositions || cfg.maxConcurrentPositions);
+        const sameSideCount =
+          this.activePositions.filter((p) => p.side === side).length +
+          this.pendingOrders.filter((o) => o.side === side).length;
+        if (sameSideCount >= maxSameSide) continue;
+
+        this.lastSignalBarByBase[base] = s.lastBarTime;
 
         const activeEq = Math.max(100, eq);
         const marginAlloc =
@@ -1438,6 +1640,15 @@ class ServerBotDaemon {
       this.inFlightClosures.add(positionId);
       const category = resolveBybitCategory(this.config.marketType);
       try {
+        // Cancel any resting Maker Limit TP order before sending Market close so no orphan remains
+        const restingTp = this.tpOrderByPosId[positionId];
+        if (restingTp) {
+          await cancelBybitOrder(category, pos.symbol, restingTp.orderId, this.privateEnv).catch(
+            () => {}
+          );
+          delete this.tpOrderByPosId[positionId];
+        }
+
         await placeBybitOrder(
           {
             category,
@@ -1456,6 +1667,7 @@ class ServerBotDaemon {
         delete this.positionIdxById[positionId];
         delete this.positionRawSizeById[positionId];
         delete this.closeRetryAfterById[positionId];
+        delete this.tpSyncRetryAfterByPosId[positionId];
         this.activePositions = this.activePositions.filter((p) => p.id !== positionId);
         this.recordClosedTrade(pos, exitPrice, reason, false);
         await this.syncExchangeState(true);

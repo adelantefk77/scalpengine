@@ -54,7 +54,9 @@ export const ScannerView: React.FC = () => {
     const position = pairTelemetries.filter((p) =>
       ['IN_POSITION_LONG', 'IN_POSITION_SHORT'].includes(p.status)
     ).length;
-    const adx = pairTelemetries.filter((p) => p.status === 'BLOCKED_ADX' || p.status === 'BLOCKED_ATR').length;
+    const adx = pairTelemetries.filter((p) =>
+      ['BLOCKED_ADX', 'BLOCKED_ATR', 'BLOCKED_TREND', 'BLOCKED_WICK'].includes(p.status)
+    ).length;
     const paused = pairTelemetries.filter((p) => config.pausedPairs.includes(p.base)).length;
     return { all: pairTelemetries.length, signal, position, adx, paused };
   }, [pairTelemetries, config.pausedPairs]);
@@ -70,7 +72,7 @@ export const ScannerView: React.FC = () => {
         return ['IN_POSITION_LONG', 'IN_POSITION_SHORT'].includes(p.status);
       }
       if (filterTab === 'adx') {
-        return p.status === 'BLOCKED_ADX' || p.status === 'BLOCKED_ATR';
+        return ['BLOCKED_ADX', 'BLOCKED_ATR', 'BLOCKED_TREND', 'BLOCKED_WICK'].includes(p.status);
       }
       if (filterTab === 'paused') {
         return config.pausedPairs.includes(p.base);
@@ -192,6 +194,10 @@ export const ScannerView: React.FC = () => {
         return <span className="px-2 py-0.5 rounded bg-surface-container-highest text-error font-mono text-[10px] font-bold">BLOKADA ADX</span>;
       case 'BLOCKED_ATR':
         return <span className="px-2 py-0.5 rounded bg-surface-container-highest text-primary font-mono text-[10px] font-bold">ANTI-CRASH ATR</span>;
+      case 'BLOCKED_TREND':
+        return <span className="px-2 py-0.5 rounded bg-surface-container-highest text-error font-mono text-[10px] font-bold">BLOKADA HTF</span>;
+      case 'BLOCKED_WICK':
+        return <span className="px-2 py-0.5 rounded bg-surface-container-highest text-primary font-mono text-[10px] font-bold">BRAK KNOTA</span>;
       case 'PAUSED':
         return <span className="px-2 py-0.5 rounded bg-surface-container text-on-surface-variant font-mono text-[10px] font-bold">WSTRZYMANA</span>;
       default:
@@ -210,7 +216,7 @@ export const ScannerView: React.FC = () => {
                 { id: 'all', label: 'Wszystkie pary', count: counts.all },
                 { id: 'signal', label: 'Blisko sygnału', count: counts.signal },
                 { id: 'position', label: 'Pozycje aktywne', count: counts.position },
-                { id: 'adx', label: 'Zablokowane ADX', count: counts.adx },
+                { id: 'adx', label: 'Zablokowane', count: counts.adx },
                 { id: 'paused', label: 'Wstrzymane', count: counts.paused },
               ] as const
             ).map((tab) => (

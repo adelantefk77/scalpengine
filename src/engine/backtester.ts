@@ -199,8 +199,8 @@ export function runHistoricalBacktest(
           exitPrice = pos.slPrice * (1 - slippageRate);
         } else if (hitTp) {
           exitReason = 'TP_HIT';
-          exitPrice = activeTp;
-          isMakerExit = strategy.postOnly;
+          isMakerExit = Boolean(strategy.makerTakeProfit);
+          exitPrice = isMakerExit ? activeTp : activeTp * (1 - slippageRate);
         }
       } else {
         const hitSl = pt.high >= pos.slPrice;
@@ -213,8 +213,8 @@ export function runHistoricalBacktest(
           exitPrice = pos.slPrice * (1 + slippageRate);
         } else if (hitTp) {
           exitReason = 'TP_HIT';
-          exitPrice = activeTp;
-          isMakerExit = strategy.postOnly;
+          isMakerExit = Boolean(strategy.makerTakeProfit);
+          exitPrice = isMakerExit ? activeTp : activeTp * (1 + slippageRate);
         }
       }
 
@@ -349,6 +349,15 @@ export function runHistoricalBacktest(
         if (evalRes.status !== 'SIGNAL_LONG' && evalRes.status !== 'SIGNAL_SHORT') continue;
 
         const side: 'LONG' | 'SHORT' = evalRes.status === 'SIGNAL_LONG' ? 'LONG' : 'SHORT';
+        const maxSameSide = Math.max(1, strategy.maxSameSidePositions || strategy.maxConcurrentPositions);
+        let sameSideCount = 0;
+        for (const op of openPositions.values()) {
+          if (op.side === side) sameSideCount += 1;
+        }
+        for (const po of pendingOrders.values()) {
+          if (po.side === side) sameSideCount += 1;
+        }
+        if (sameSideCount >= maxSameSide) continue;
         const marginAllocation =
           strategy.sizingMode === 'percent'
             ? equity * (strategy.positionPercent / 100)

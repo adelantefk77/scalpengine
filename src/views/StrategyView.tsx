@@ -108,18 +108,41 @@ export const StrategyView: React.FC = () => {
 
   const availableToAdd = ALL_SCANNER_ASSETS.filter((a) => !draft.activePairs.includes(a));
 
-  // Estimated daily signal frequency & theoretical win rate based on Z-Score + ADX gate
+  // Estimated daily signal frequency & theoretical win rate based on Z-Score + ADX + Sniper filters
   const estimatedSignalsPerDay = useMemo(() => {
     const perPair = 3.2 * Math.exp(-0.95 * (draft.zScoreThreshold - 1.5));
     const tfFactor = draft.timeframe === '1' ? 2.4 : draft.timeframe === '3' ? 1.3 : 1.0;
-    return Math.max(4, Math.round(perPair * draft.activePairs.length * tfFactor));
-  }, [draft.zScoreThreshold, draft.activePairs.length, draft.timeframe]);
+    const htfFactor = draft.htfTrendFilter ? 0.78 : 1.0;
+    const wickFactor = draft.wickConfirmFilter ? Math.max(0.45, 0.76 - (draft.minWickRatioPct - 20) * 0.008) : 1.0;
+    return Math.max(2, Math.round(perPair * draft.activePairs.length * tfFactor * htfFactor * wickFactor));
+  }, [
+    draft.zScoreThreshold,
+    draft.activePairs.length,
+    draft.timeframe,
+    draft.htfTrendFilter,
+    draft.wickConfirmFilter,
+    draft.minWickRatioPct,
+  ]);
 
   const estimatedWinRate = useMemo(() => {
-    const tpBonus = draft.tpMode === 'atr' && draft.tpAtrMult <= 1.5 ? 5.5 : 0;
-    const base = 54 + (draft.zScoreThreshold - 1.5) * 8.0 + (28 - Math.min(28, draft.adxMax)) * 0.6 + tpBonus;
+    const tpBonus = draft.tpMode === 'atr' && draft.tpAtrMult <= 1.5 ? 4.5 : draft.makerTakeProfit ? 2.5 : 0;
+    const filterBonus =
+      (draft.confirmCandleClose ? 1.5 : 0) +
+      (draft.htfTrendFilter ? 2.0 : 0) +
+      (draft.wickConfirmFilter ? 1.8 : 0);
+    const base =
+      53 + (draft.zScoreThreshold - 1.5) * 7.5 + (28 - Math.min(28, draft.adxMax)) * 0.55 + tpBonus + filterBonus;
     return Math.min(76.0, Math.max(45.0, base));
-  }, [draft.zScoreThreshold, draft.adxMax, draft.tpMode, draft.tpAtrMult]);
+  }, [
+    draft.zScoreThreshold,
+    draft.adxMax,
+    draft.tpMode,
+    draft.tpAtrMult,
+    draft.makerTakeProfit,
+    draft.confirmCandleClose,
+    draft.htfTrendFilter,
+    draft.wickConfirmFilter,
+  ]);
 
   // Dynamic Gaussian Bell SVG x-positions for Z-Score thresholds
   const zOffsetPx = Math.min(115, Math.max(40, (draft.zScoreThreshold / 3.0) * 110));
@@ -402,10 +425,10 @@ export const StrategyView: React.FC = () => {
             )}
           </div>
 
-          {/* Post-Only Toggle */}
+          {/* Post-Only Entry Toggle */}
           <div className="flex items-center justify-between p-3 rounded-lg bg-surface-container-low">
             <div className="flex flex-col pr-3">
-              <span className="font-display text-xs font-bold text-on-surface">Wymuś Limit Post-Only</span>
+              <span className="font-display text-xs font-bold text-on-surface">Wymuś Limit Post-Only (Wejście)</span>
               <span className="text-[11px] text-on-surface-variant">
                 Prowizja Maker {draft.makerFeePct.toFixed(3)}% zamiast Taker {draft.takerFeePct.toFixed(3)}%
               </span>
@@ -417,6 +440,28 @@ export const StrategyView: React.FC = () => {
                 draft.postOnly ? 'bg-primary-container justify-end' : 'bg-surface-container-highest justify-start'
               }`}
               aria-label="Przełącz Post-Only"
+            >
+              <span className="w-5 h-5 rounded-full bg-on-surface" />
+            </button>
+          </div>
+
+          {/* Maker Limit TP Toggle (Package 1) */}
+          <div className="flex items-center justify-between p-3 rounded-lg bg-surface-container-low">
+            <div className="flex flex-col pr-3">
+              <span className="font-display text-xs font-bold text-on-surface">
+                Maker Limit TP ({draft.makerFeePct.toFixed(2)}%)
+              </span>
+              <span className="text-[11px] text-on-surface-variant">
+                Zlecenie Limit reduceOnly na TP (0 poślizgu + dynamiczne EMA) zamiast Market Taker
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDraft((prev) => ({ ...prev, makerTakeProfit: !prev.makerTakeProfit }))}
+              className={`w-11 h-6 rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
+                draft.makerTakeProfit ? 'bg-tertiary justify-end' : 'bg-surface-container-highest justify-start'
+              }`}
+              aria-label="Przełącz Maker Limit TP"
             >
               <span className="w-5 h-5 rounded-full bg-on-surface" />
             </button>
@@ -626,6 +671,108 @@ export const StrategyView: React.FC = () => {
                 <span>x ATR</span>
               </div>
             </div>
+
+            {/* Package 2: Toggleable Sniper / Entry Quality Filters */}
+            <div className="flex flex-col gap-2 p-3 rounded-lg bg-surface-container-lowest border border-white/5">
+              <div className="flex items-center justify-between">
+                <span className="font-mono text-[10px] uppercase text-primary font-bold tracking-wider">
+                  Filtry Jakości Wejścia (Snajper)
+                </span>
+                <span className="font-mono text-[10px] text-on-surface-variant">ON / OFF</span>
+              </div>
+
+              {/* Confirm Candle Close */}
+              <div className="flex items-center justify-between gap-2 pt-1">
+                <div className="flex flex-col">
+                  <span className="text-xs font-semibold text-on-surface">Zamknięcie świecy (Close)</span>
+                  <span className="text-[10px] text-on-surface-variant">
+                    Wejście po zamknięciu świecy zamiast intrabar szpilki
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDraft((prev) => ({ ...prev, confirmCandleClose: !prev.confirmCandleClose }))
+                  }
+                  className={`w-10 h-5 rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
+                    draft.confirmCandleClose
+                      ? 'bg-tertiary justify-end'
+                      : 'bg-surface-container-highest justify-start'
+                  }`}
+                  aria-label="Przełącz potwierdzenie zamknięcia świecy"
+                >
+                  <span className="w-4 h-4 rounded-full bg-on-surface" />
+                </button>
+              </div>
+
+              {/* HTF Trend Filter */}
+              <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/5">
+                <div className="flex flex-col">
+                  <span className="text-xs font-semibold text-on-surface">Filtr Trendu HTF (EMA50/100)</span>
+                  <span className="text-[10px] text-on-surface-variant">
+                    Blokuje łapanie noży przeciw silnemu trendowi
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDraft((prev) => ({ ...prev, htfTrendFilter: !prev.htfTrendFilter }))}
+                  className={`w-10 h-5 rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
+                    draft.htfTrendFilter
+                      ? 'bg-tertiary justify-end'
+                      : 'bg-surface-container-highest justify-start'
+                  }`}
+                  aria-label="Przełącz filtr trendu HTF"
+                >
+                  <span className="w-4 h-4 rounded-full bg-on-surface" />
+                </button>
+              </div>
+
+              {/* Wick Rejection Filter */}
+              <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-white/5">
+                <div className="flex flex-col">
+                  <span className="text-xs font-semibold text-on-surface">Potwierdzenie knota (Wick)</span>
+                  <span className="text-[10px] text-on-surface-variant">
+                    Wymaga knota odrzucenia ≥ min. % zakresu świecy
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {draft.wickConfirmFilter && (
+                    <div className="flex items-center bg-surface-container-highest px-1.5 py-0.5 rounded font-mono text-[11px] text-tertiary font-bold">
+                      <input
+                        type="number"
+                        min="5"
+                        max="60"
+                        step="5"
+                        value={draft.minWickRatioPct}
+                        onChange={(e) =>
+                          setDraft((prev) => ({
+                            ...prev,
+                            minWickRatioPct: Math.min(60, Math.max(5, Number(e.target.value) || 20)),
+                          }))
+                        }
+                        className="w-9 bg-transparent text-right outline-none tabular-nums"
+                        title="Minimalny udział knota w zakresie świecy (%)"
+                      />
+                      <span>%</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDraft((prev) => ({ ...prev, wickConfirmFilter: !prev.wickConfirmFilter }))
+                    }
+                    className={`w-10 h-5 rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
+                      draft.wickConfirmFilter
+                        ? 'bg-tertiary justify-end'
+                        : 'bg-surface-container-highest justify-start'
+                    }`}
+                    aria-label="Przełącz potwierdzenie knota"
+                  >
+                    <span className="w-4 h-4 rounded-full bg-on-surface" />
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -812,7 +959,7 @@ export const StrategyView: React.FC = () => {
                   onChange={(e) =>
                     setDraft((prev) => ({
                       ...prev,
-                      timeStopMinutes: Math.min(120, Math.max(3, Number(e.target.value) || 12)),
+                      timeStopMinutes: Math.min(120, Math.max(3, Number(e.target.value) || 45)),
                     }))
                   }
                   className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-on-surface font-bold outline-none tabular-nums"
@@ -828,16 +975,48 @@ export const StrategyView: React.FC = () => {
                   min="1"
                   max="10"
                   value={draft.maxConcurrentPositions}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    const nextMax = Math.min(10, Math.max(1, Number(e.target.value) || 3));
                     setDraft((prev) => ({
                       ...prev,
-                      maxConcurrentPositions: Math.min(10, Math.max(1, Number(e.target.value) || 3)),
-                    }))
-                  }
+                      maxConcurrentPositions: nextMax,
+                      maxSameSidePositions: Math.min(prev.maxSameSidePositions, nextMax),
+                    }));
+                  }}
                   className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-on-surface font-bold outline-none tabular-nums"
                 />
                 <span className="text-xs text-on-surface-variant">równolegle</span>
               </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface-container-low">
+            <div className="flex flex-col pr-2">
+              <span className="font-mono text-[10px] uppercase text-on-surface-variant">
+                Limit w 1 kierunku (Korelacja)
+              </span>
+              <span className="text-[11px] text-on-surface-variant">
+                Maks. jednoczesnych LONG lub SHORT
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <input
+                type="number"
+                min="1"
+                max={draft.maxConcurrentPositions}
+                value={draft.maxSameSidePositions}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    maxSameSidePositions: Math.min(
+                      prev.maxConcurrentPositions,
+                      Math.max(1, Number(e.target.value) || 2)
+                    ),
+                  }))
+                }
+                className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-primary font-bold outline-none tabular-nums"
+              />
+              <span className="text-xs text-on-surface-variant">/ stronę</span>
             </div>
           </div>
 
