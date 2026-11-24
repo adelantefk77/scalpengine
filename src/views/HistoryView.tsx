@@ -1,5 +1,18 @@
 import React, { useMemo, useState } from 'react';
-import { CalendarDays, ChevronLeft, ChevronRight, Download, Filter, LineChart, Search, Trash2, X } from 'lucide-react';
+import {
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Filter,
+  LineChart,
+  PauseCircle,
+  PlayCircle,
+  Search,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { LosingPairsToggleButton } from '../components/LosingPairsToggleButton';
 import { useBot } from '../engine/botContext';
 import { downloadCsv, formatPrice, formatShortDateTime, formatUsd } from '../engine/format';
 
@@ -23,7 +36,16 @@ function formatCompactTilePnl(value: number): string {
 const WEEKDAY_LABELS = ['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'Sb', 'Nd'];
 
 export const HistoryView: React.FC = () => {
-  const { closedTrades, executionMode, resetPaperAccount, refreshPrivateAccount, setActiveRoute, showToast } = useBot();
+  const {
+    config,
+    closedTrades,
+    executionMode,
+    resetPaperAccount,
+    refreshPrivateAccount,
+    togglePausePair,
+    setActiveRoute,
+    showToast,
+  } = useBot();
   const [sideFilter, setSideFilter] = useState<'ALL' | 'LONG' | 'SHORT'>('ALL');
   const [outcomeFilter, setOutcomeFilter] = useState<'ALL' | 'WIN' | 'LOSS'>('ALL');
   const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
@@ -162,13 +184,14 @@ export const HistoryView: React.FC = () => {
     }
 
     // By pair summary
-    const byPairMap = new Map<string, { pair: string; trades: number; wins: number; net: number }>();
+    const byPairMap = new Map<string, { base: string; pair: string; trades: number; wins: number; net: number }>();
     for (const t of closedTrades) {
-      const cur = byPairMap.get(t.displayPair) || { pair: t.displayPair, trades: 0, wins: 0, net: 0 };
+      const base = (t.base || t.symbol.replace(/(USDT|USDC|PERP)$/, '')).toUpperCase();
+      const cur = byPairMap.get(base) || { base, pair: t.displayPair, trades: 0, wins: 0, net: 0 };
       cur.trades += 1;
       if (t.netPnlUsd > 0) cur.wins += 1;
       cur.net += t.netPnlUsd;
-      byPairMap.set(t.displayPair, cur);
+      byPairMap.set(base, cur);
     }
 
     return {
@@ -248,7 +271,7 @@ export const HistoryView: React.FC = () => {
           ) : (
             <button
               type="button"
-              onClick={resetPaperAccount}
+              onClick={() => void resetPaperAccount()}
               className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-error-container hover:text-on-error-container text-on-surface-variant text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -467,20 +490,51 @@ export const HistoryView: React.FC = () => {
             </div>
           </div>
 
-          <div className="bg-surface-container-low p-4 rounded-xl border border-white/5 flex flex-col gap-2">
-            <span className="font-display text-sm font-bold text-on-surface">Skuteczność wg Par</span>
+          <div className="bg-surface-container-low p-4 rounded-xl border border-white/5 flex flex-col gap-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-display text-sm font-bold text-on-surface">Skuteczność wg Par</span>
+              <LosingPairsToggleButton size="xs" />
+            </div>
             <div className="flex flex-wrap gap-2 font-mono text-xs tabular-nums">
-              {analytics.byPair.map((bp) => (
-                <div key={bp.pair} className="bg-surface-container-lowest px-3 py-2 rounded-lg flex items-center gap-3">
-                  <span className="font-bold text-on-surface">{bp.pair}</span>
-                  <span className="text-on-surface-variant">
-                    {((bp.wins / bp.trades) * 100).toFixed(0)}% ({bp.trades})
-                  </span>
-                  <span className={bp.net >= 0 ? 'text-tertiary font-bold' : 'text-error font-bold'}>
-                    {formatUsd(bp.net, true)}
-                  </span>
-                </div>
-              ))}
+              {analytics.byPair.map((bp) => {
+                const isPaused = config.pausedPairs.includes(bp.base);
+                return (
+                  <div
+                    key={bp.base}
+                    className={`px-2.5 py-1.5 rounded-lg flex items-center gap-2.5 border transition-colors ${
+                      isPaused
+                        ? 'bg-surface-container-lowest/50 border-primary/30 opacity-75'
+                        : 'bg-surface-container-lowest border-white/5'
+                    }`}
+                  >
+                    <span className={`font-bold ${isPaused ? 'text-on-surface-variant line-through' : 'text-on-surface'}`}>
+                      {bp.pair}
+                    </span>
+                    <span className="text-on-surface-variant">
+                      {((bp.wins / bp.trades) * 100).toFixed(0)}% ({bp.trades})
+                    </span>
+                    <span className={bp.net >= 0 ? 'text-tertiary font-bold' : 'text-error font-bold'}>
+                      {formatUsd(bp.net, true)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void togglePausePair(bp.base)}
+                      title={
+                        isPaused
+                          ? `Włącz ponownie parę ${bp.base}`
+                          : `Wstrzymaj nowe wejścia na parze ${bp.base}`
+                      }
+                      className={`p-0.5 rounded transition-colors ${
+                        isPaused
+                          ? 'text-tertiary hover:text-on-surface'
+                          : 'text-on-surface-variant hover:text-error'
+                      }`}
+                    >
+                      {isPaused ? <PlayCircle className="w-3.5 h-3.5" /> : <PauseCircle className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>

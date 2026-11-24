@@ -10,6 +10,7 @@ import {
   TrendingUp,
   Zap,
 } from 'lucide-react';
+import { apiFetch } from '../engine/apiClient';
 import { HistoricalBasketData, runHistoricalBacktest } from '../engine/backtester';
 import { useBot } from '../engine/botContext';
 import { downloadCsv, formatPrice, formatShortDateTime, formatUsd } from '../engine/format';
@@ -30,34 +31,48 @@ export const BacktesterView: React.FC = () => {
   });
 
   const [isRunning, setIsRunning] = useState(false);
+  const [progressText, setProgressText] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
 
   const executeBacktest = useCallback(async () => {
     setIsRunning(true);
     setError(null);
+    setProgressText(`Pobieranie 0 / ${params.basket.length} par...`);
     try {
       const basketData: HistoricalBasketData[] = [];
-      await Promise.all(
-        params.basket.map(async (base) => {
-          const { symbol, category } = formatBybitSymbol(base, config.marketType, config.quoteCurrency);
-          const res = await fetch(
-            `/api/bybit/klines-range?category=${category}&symbol=${encodeURIComponent(symbol)}&interval=${config.timeframe}&bars=${params.barsPerPair}`
-          );
-          const json = await res.json();
-          if (res.ok && json.retCode === 0 && Array.isArray(json.result?.list)) {
-            const candles = parseBybitKlines(json.result.list);
-            if (candles.length > 0) {
-              basketData.push({ base, candles });
+      const batchSize = 4;
+      let completed = 0;
+
+      for (let i = 0; i < params.basket.length; i += batchSize) {
+        const chunk = params.basket.slice(i, i + batchSize);
+        await Promise.all(
+          chunk.map(async (base) => {
+            const { symbol, category } = formatBybitSymbol(base, config.marketType, config.quoteCurrency);
+            const res = await apiFetch(
+              `/api/bybit/klines-range?category=${category}&symbol=${encodeURIComponent(symbol)}&interval=${config.timeframe}&bars=${params.barsPerPair}`
+            );
+            if (res.status === 401) {
+              throw new Error('Sesja wygasła — zaloguj się ponownie, aby uruchomić backtest.');
             }
-          }
-        })
-      );
+            const json = await res.json();
+            if (res.ok && json.retCode === 0 && Array.isArray(json.result?.list)) {
+              const candles = parseBybitKlines(json.result.list);
+              if (candles.length > 0) {
+                basketData.push({ base, candles });
+              }
+            }
+            completed += 1;
+            setProgressText(`Pobieranie ${completed} / ${params.basket.length} par...`);
+          })
+        );
+      }
 
       if (basketData.length === 0) {
         throw new Error('Nie udało się pobrać historycznych świec z Bybit API.');
       }
 
+      setProgressText('Uruchamianie symulacji Mean Reversion...');
       const simConfig = {
         ...config,
         makerFeePct: params.makerFeePct,
@@ -70,12 +85,13 @@ export const BacktesterView: React.FC = () => {
       setError(err instanceof Error ? err.message : 'Błąd uruchamiania backtestu');
     } finally {
       setIsRunning(false);
+      setProgressText('');
     }
   }, [params, config]);
 
-  // Run initial real historical backtest on mount
+  // Run initial real historical backtest on mount (batched safely to avoid Bybit rate limits)
   useEffect(() => {
-    executeBacktest();
+    void executeBacktest();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -122,18 +138,20 @@ export const BacktesterView: React.FC = () => {
     showToast('Wyeksportowano raport backtestu do CSV.', 'success');
   };
 
-  const handleApplyToLive = () => {
-    updateConfig(
+  const handleApplyToLive = async () => {
+    const ok = await updateConfig(
       {
         ...config,
-        activePairs: Array.from(new Set([...config.activePairs, ...params.basket])),
+        activePairs: [...params.basket],
         makerFeePct: params.makerFeePct,
         takerFeePct: params.takerFeePct,
         slippagePct: params.slippagePct,
       },
-      `Zastosowano parametry z backtestu (${params.basket.join(', ')}) do bota na żywo.`
+      `Zastosowano koszyk z backtestu (${params.basket.length} par: ${params.basket.join(', ')}) do bota na żywo.`
     );
-    showToast('Parametry backtestu zsynchronizowane z silnikiem Live.', 'success');
+    if (ok) {
+      showToast(`Koszyk (${params.basket.length} par) i parametry zsynchronizowane z silnikiem Live.`, 'success');
+    }
   };
 
   // Equity & Drawdown SVG geometry
@@ -343,7 +361,7 @@ export const BacktesterView: React.FC = () => {
             {isRunning ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>Pobieranie świec Bybit i symulacja...</span>
+                <span>{progressText || 'Pobieranie świec Bybit i symulacja...'}</span>
               </>
             ) : (
               <>

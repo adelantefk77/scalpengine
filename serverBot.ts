@@ -68,11 +68,106 @@ interface PersistedBotState {
   events: BotEvent[];
   migratedAssets?: string[];
   positionOpenedAtById?: Record<string, number>;
+  consecutiveLosses?: number;
+  cooldownUntil?: number;
+  lastSignalBarByBase?: Record<string, number>;
+  dailyLossGuardDate?: string | null;
 }
 
 const DEFAULT_START_EQUITY = 25000;
-const NEW_RECOMMENDED_ASSETS = ['ENA', 'WLD', 'HBAR'];
+const NEW_RECOMMENDED_ASSETS = ['ENA', 'WLD', 'HBAR', 'FARTCOIN'];
 const STATE_FILE_PATH = path.resolve(process.cwd(), '.scalpengine-state.json');
+
+function getUtcDayKey(ts = Date.now()): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+function clampNum(val: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+export function sanitizeStrategyConfig(
+  raw: Partial<StrategyConfig>,
+  fallback: StrategyConfig = DEFAULT_STRATEGY_CONFIG
+): StrategyConfig {
+  const allowedAssets = new Set(ALL_SCANNER_ASSETS);
+  const rawPairs = Array.isArray(raw.activePairs) ? raw.activePairs : fallback.activePairs;
+  const activePairs = Array.from(
+    new Set(rawPairs.filter((p): p is string => typeof p === 'string' && allowedAssets.has(p)))
+  );
+  const safeActivePairs = activePairs.length > 0 ? activePairs : [...fallback.activePairs];
+
+  const rawPaused = Array.isArray(raw.pausedPairs) ? raw.pausedPairs : fallback.pausedPairs;
+  const pausedPairs = Array.from(
+    new Set(rawPaused.filter((p): p is string => typeof p === 'string' && allowedAssets.has(p)))
+  );
+
+  const preset =
+    raw.preset === 'conservative' || raw.preset === 'balanced' || raw.preset === 'aggressive'
+      ? raw.preset
+      : fallback.preset;
+  const marketType =
+    raw.marketType === 'perp_usdt' || raw.marketType === 'perp_usdc' || raw.marketType === 'spot_margin'
+      ? raw.marketType
+      : fallback.marketType;
+  const quoteCurrency =
+    raw.quoteCurrency === 'USDT' || raw.quoteCurrency === 'USDC' || raw.quoteCurrency === 'EURQ'
+      ? raw.quoteCurrency
+      : fallback.quoteCurrency;
+  const timeframe =
+    raw.timeframe === '1' || raw.timeframe === '3' || raw.timeframe === '5'
+      ? raw.timeframe
+      : fallback.timeframe;
+  const meanAnchor =
+    raw.meanAnchor === 'ema20' || raw.meanAnchor === 'vwap' ? raw.meanAnchor : fallback.meanAnchor;
+  const sizingMode =
+    raw.sizingMode === 'percent' || raw.sizingMode === 'fixed' ? raw.sizingMode : fallback.sizingMode;
+  const tpMode = raw.tpMode === 'mean' || raw.tpMode === 'atr' ? raw.tpMode : fallback.tpMode;
+
+  const rsiLongMax = Math.round(clampNum(raw.rsiLongMax, fallback.rsiLongMax, 5, 45));
+  const rsiShortMin = Math.round(
+    clampNum(raw.rsiShortMin, fallback.rsiShortMin, Math.max(55, rsiLongMax + 10), 95)
+  );
+
+  return {
+    preset,
+    marketType,
+    quoteCurrency,
+    timeframe,
+    activePairs: safeActivePairs,
+    pausedPairs,
+    postOnly: typeof raw.postOnly === 'boolean' ? raw.postOnly : fallback.postOnly,
+    limitOffsetTicks: clampNum(raw.limitOffsetTicks, fallback.limitOffsetTicks, 0, 15),
+    orderTtlSec: Math.round(clampNum(raw.orderTtlSec, fallback.orderTtlSec, 5, 180)),
+    meanAnchor,
+    zScoreThreshold: Number(clampNum(raw.zScoreThreshold, fallback.zScoreThreshold, 1.2, 4.0).toFixed(2)),
+    rsiLongMax,
+    rsiShortMin,
+    adxMax: Number(clampNum(raw.adxMax, fallback.adxMax, 10, 60).toFixed(1)),
+    antiCrashAtrMult: Number(clampNum(raw.antiCrashAtrMult, fallback.antiCrashAtrMult, 1.5, 8.0).toFixed(1)),
+    sizingMode,
+    positionPercent: Number(clampNum(raw.positionPercent, fallback.positionPercent, 1, 35).toFixed(1)),
+    positionFixedUsd: Math.round(clampNum(raw.positionFixedUsd, fallback.positionFixedUsd, 10, 100000)),
+    leverage: Math.round(clampNum(raw.leverage, fallback.leverage, 1, 10)),
+    tpMode,
+    tpAtrMult: Number(clampNum(raw.tpAtrMult, fallback.tpAtrMult, 0.5, 6.0).toFixed(2)),
+    slAtrMult: Number(clampNum(raw.slAtrMult, fallback.slAtrMult, 0.8, 5.0).toFixed(2)),
+    timeStopMinutes: Math.round(clampNum(raw.timeStopMinutes, fallback.timeStopMinutes, 3, 120)),
+    maxConcurrentPositions: Math.round(
+      clampNum(raw.maxConcurrentPositions, fallback.maxConcurrentPositions, 1, 10)
+    ),
+    dailyMaxLossPct: Number(clampNum(raw.dailyMaxLossPct, fallback.dailyMaxLossPct, 0.5, 25).toFixed(1)),
+    maxConsecutiveLosses: Math.round(
+      clampNum(raw.maxConsecutiveLosses, fallback.maxConsecutiveLosses, 1, 15)
+    ),
+    cooldownMinutes: Math.round(clampNum(raw.cooldownMinutes, fallback.cooldownMinutes, 5, 720)),
+    makerFeePct: Number(clampNum(raw.makerFeePct, fallback.makerFeePct, -0.05, 0.5).toFixed(4)),
+    takerFeePct: Number(clampNum(raw.takerFeePct, fallback.takerFeePct, 0, 0.5).toFixed(4)),
+    slippagePct: Number(clampNum(raw.slippagePct, fallback.slippagePct, 0, 1.0).toFixed(3)),
+  };
+}
 
 class ServerBotDaemon {
   private config: StrategyConfig = { ...DEFAULT_STRATEGY_CONFIG };
@@ -103,12 +198,15 @@ class ServerBotDaemon {
 
   private consecutiveLosses = 0;
   private cooldownUntil = 0;
+  private dailyLossGuardDate: string | null = null;
   private lastSignalBarByBase: Record<string, number> = {};
   private lastAdxWarnByBase: Record<string, number> = {};
   private inFlightOrders = new Set<string>();
+  private inFlightCancellations = new Set<string>();
   private inFlightClosures = new Set<string>();
   private positionOpenedAtById: Record<string, number> = {};
   private positionIdxById: Record<string, number> = {};
+  private positionRawSizeById: Record<string, string> = {};
   private closeRetryAfterById: Record<string, number> = {};
   private orderMetaBySymbol: Record<
     string,
@@ -162,7 +260,7 @@ class ServerBotDaemon {
         const raw = fs.readFileSync(STATE_FILE_PATH, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<PersistedBotState>;
         if (parsed.config) {
-          this.config = { ...DEFAULT_STRATEGY_CONFIG, ...parsed.config };
+          this.config = sanitizeStrategyConfig(parsed.config, DEFAULT_STRATEGY_CONFIG);
           const prevMigrated = new Set(Array.isArray(parsed.migratedAssets) ? parsed.migratedAssets : []);
           const toAdd = NEW_RECOMMENDED_ASSETS.filter(
             (asset) => !prevMigrated.has(asset) && !this.config.activePairs.includes(asset)
@@ -172,6 +270,7 @@ class ServerBotDaemon {
               ...this.config,
               activePairs: [...this.config.activePairs, ...toAdd],
             };
+            this.schedulePersist();
           }
           this.migratedAssets = Array.from(new Set([...prevMigrated, ...NEW_RECOMMENDED_ASSETS]));
         }
@@ -189,6 +288,18 @@ class ServerBotDaemon {
         }
         if (parsed.positionOpenedAtById && typeof parsed.positionOpenedAtById === 'object') {
           this.positionOpenedAtById = { ...parsed.positionOpenedAtById };
+        }
+        if (typeof parsed.consecutiveLosses === 'number' && Number.isFinite(parsed.consecutiveLosses)) {
+          this.consecutiveLosses = Math.max(0, Math.round(parsed.consecutiveLosses));
+        }
+        if (typeof parsed.cooldownUntil === 'number' && Number.isFinite(parsed.cooldownUntil)) {
+          this.cooldownUntil = Math.max(0, parsed.cooldownUntil);
+        }
+        if (parsed.lastSignalBarByBase && typeof parsed.lastSignalBarByBase === 'object') {
+          this.lastSignalBarByBase = { ...parsed.lastSignalBarByBase };
+        }
+        if (typeof parsed.dailyLossGuardDate === 'string' && parsed.dailyLossGuardDate.length === 10) {
+          this.dailyLossGuardDate = parsed.dailyLossGuardDate;
         }
         if (
           parsed.privateEnv === 'demo' ||
@@ -218,27 +329,43 @@ class ServerBotDaemon {
     }
   }
 
+  private writeStateToDiskSync() {
+    try {
+      const payload: PersistedBotState = {
+        config: this.config,
+        executionMode: this.executionMode,
+        privateEnv: this.privateEnv,
+        botState: this.botState,
+        paperEquity: this.paperEquity,
+        closedTrades: this.closedTrades.slice(0, 500),
+        events: this.events.slice(0, 100),
+        migratedAssets: this.migratedAssets,
+        positionOpenedAtById: this.positionOpenedAtById,
+        consecutiveLosses: this.consecutiveLosses,
+        cooldownUntil: this.cooldownUntil,
+        lastSignalBarByBase: this.lastSignalBarByBase,
+        dailyLossGuardDate: this.dailyLossGuardDate,
+      };
+      fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(payload), 'utf-8');
+    } catch {
+      // ignore read-only container filesystem
+    }
+  }
+
   private schedulePersist() {
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      try {
-        const payload: PersistedBotState = {
-          config: this.config,
-          executionMode: this.executionMode,
-          privateEnv: this.privateEnv,
-          botState: this.botState,
-          paperEquity: this.paperEquity,
-          closedTrades: this.closedTrades.slice(0, 500),
-          events: this.events.slice(0, 100),
-          migratedAssets: this.migratedAssets,
-          positionOpenedAtById: this.positionOpenedAtById,
-        };
-        fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(payload), 'utf-8');
-      } catch {
-        // ignore read-only container filesystem
-      }
+      this.writeStateToDiskSync();
     }, 1000);
+  }
+
+  public flushPersistNow() {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    this.writeStateToDiskSync();
   }
 
   private pushEvent(ev: Omit<BotEvent, 'id' | 'timestamp'>) {
@@ -503,6 +630,9 @@ class ServerBotDaemon {
         const posId = `${symbol}-${p.side}`;
         nextOpenIds.add(posId);
         this.positionIdxById[posId] = Number(p.positionIdx || 0);
+        if (p.size) {
+          this.positionRawSizeById[posId] = String(p.size);
+        }
 
         const { base, displayPair, snapshot } = this.resolveSymbolDisplay(symbol);
         const meta = this.orderMetaBySymbol[symbol];
@@ -577,6 +707,7 @@ class ServerBotDaemon {
         if (!nextOpenIds.has(trackedId)) {
           delete this.positionOpenedAtById[trackedId];
           delete this.positionIdxById[trackedId];
+          delete this.positionRawSizeById[trackedId];
           delete this.closeRetryAfterById[trackedId];
         }
       }
@@ -702,9 +833,35 @@ class ServerBotDaemon {
     if (this.inFlightOrders.has(s.symbol)) {
       return { ok: false, error: 'Zlecenie jest już wysyłane dla tej pary.' };
     }
-    this.inFlightOrders.add(s.symbol);
 
     const cfg = this.config;
+    if (!Number.isFinite(notionalUsd) || notionalUsd < 5.5) {
+      const msg = `Wartość zlecenia ($${notionalUsd.toFixed(2)}) jest poniżej bezpiecznego minimum Bybit ($5.50).`;
+      this.pushEvent({
+        category: 'WARNING',
+        tag: 'MIN NOTIONAL',
+        symbol: s.displayPair,
+        message: `${s.displayPair} ${side} odrzucone: ${msg}`,
+      });
+      return { ok: false, error: msg };
+    }
+
+    const requiredMargin = notionalUsd / Math.max(1, cfg.leverage);
+    if (
+      this.privateAccount.updatedAt &&
+      requiredMargin > this.privateAccount.availableBalance * 0.96
+    ) {
+      const msg = `Niewystarczające wolne saldo ($${this.privateAccount.availableBalance.toFixed(2)} dostępne vs $${requiredMargin.toFixed(2)} wymagany depozyt).`;
+      this.pushEvent({
+        category: 'WARNING',
+        tag: 'BRAK DEPOZYTU',
+        symbol: s.displayPair,
+        message: `${s.displayPair} ${side} odrzucone: ${msg}`,
+      });
+      return { ok: false, error: msg };
+    }
+
+    this.inFlightOrders.add(s.symbol);
     const category = resolveBybitCategory(cfg.marketType);
     const now = Date.now();
     this.orderMetaBySymbol[s.symbol] = {
@@ -803,6 +960,24 @@ class ServerBotDaemon {
 
       // 2. Sync exchange balance / positions / orders every 3s if in exchange mode
       const now = Date.now();
+      const todayUtcKey = getUtcDayKey(now);
+
+      // Auto-reset Daily Loss Guard pause at UTC midnight so the bot resumes cleanly on a new trading day
+      if (
+        this.dailyLossGuardDate &&
+        this.dailyLossGuardDate !== todayUtcKey &&
+        this.botState === 'PAUSED'
+      ) {
+        this.dailyLossGuardDate = null;
+        this.botState = 'RUNNING';
+        this.pushEvent({
+          category: 'SYSTEM',
+          tag: 'DAILY GUARD RESET',
+          message: `Nowa doba handlowa (${todayUtcKey} UTC) — automatycznie odblokowano Daily Loss Guard (RUNNING).`,
+        });
+        this.schedulePersist();
+      }
+
       if (this.executionMode === 'exchange' && now - this.lastExchangeSyncAt >= 3000) {
         await this.syncExchangeState();
       }
@@ -881,7 +1056,8 @@ class ServerBotDaemon {
           pos.side === 'LONG'
             ? (markPrice - pos.entryPrice) * pos.qty
             : (pos.entryPrice - markPrice) * pos.qty;
-        const uPnlUsd = grossU - pos.entryFeeUsd;
+        // On Bybit exchange mode, entry fee is already deducted from wallet balance upon fill (unrealisedPnl is pure price delta)
+        const uPnlUsd = this.executionMode === 'exchange' ? grossU : grossU - pos.entryFeeUsd;
         const uPnlPct = pos.notionalUsd > 0 ? (uPnlUsd / pos.notionalUsd) * 100 : 0;
 
         const elapsedMin = (now - pos.openedAt) / 60000;
@@ -936,15 +1112,24 @@ class ServerBotDaemon {
       if (signalResults.length === 0) return;
       if (this.botState !== 'RUNNING') return;
 
-      // 5. Check Daily Max Loss Guard
+      // 5. Check Daily Max Loss Guard (cancels resting limit orders, keeps SL/TP/Time-Stop active, resets at UTC midnight)
       const eq = this.getEffectiveEquity();
       const ddPct = this.getDrawdownPct();
       if (eq > 0 && Math.abs(ddPct) >= cfg.dailyMaxLossPct && ddPct < 0) {
         this.botState = 'PAUSED';
+        this.dailyLossGuardDate = todayUtcKey;
+        const ordersToCancel = [...this.pendingOrders];
+        if (this.executionMode === 'exchange') {
+          for (const ord of ordersToCancel) {
+            void this.cancelPendingOrder(ord.id);
+          }
+        } else {
+          this.pendingOrders = [];
+        }
         this.pushEvent({
           category: 'WARNING',
           tag: 'DAILY LOSS GUARD',
-          message: `Przekroczono dzienny limit strat (${ddPct.toFixed(2)}% >= -${cfg.dailyMaxLossPct}%). Wstrzymano nowe wejścia (PAUSED).`,
+          message: `Przekroczono dzienny limit strat (${ddPct.toFixed(2)}% >= -${cfg.dailyMaxLossPct}%). Wstrzymano nowe wejścia, anulowano ${ordersToCancel.length} zleceń Limit (auto-reset jutro 00:00 UTC).`,
         });
         this.schedulePersist();
         return;
@@ -1011,7 +1196,7 @@ class ServerBotDaemon {
         this.pendingOrders = remainingPending;
       } else if (this.executionMode === 'exchange' && this.pendingOrders.length > 0) {
         for (const ord of this.pendingOrders) {
-          if (now >= ord.expiresAt) {
+          if (now >= ord.expiresAt && !this.inFlightCancellations.has(ord.id)) {
             void this.cancelPendingOrder(ord.id);
           }
         }
@@ -1203,6 +1388,10 @@ class ServerBotDaemon {
     }
 
     if (this.executionMode === 'exchange') {
+      if (this.inFlightCancellations.has(orderId)) {
+        return { ok: false, error: 'Anulowanie tego zlecenia jest już w toku.' };
+      }
+      this.inFlightCancellations.add(orderId);
       const category = resolveBybitCategory(this.config.marketType);
       try {
         await cancelBybitOrder(category, ord.symbol, orderId, this.privateEnv);
@@ -1217,6 +1406,8 @@ class ServerBotDaemon {
         return { ok: true };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : 'Błąd anulowania na Bybit' };
+      } finally {
+        this.inFlightCancellations.delete(orderId);
       }
     }
 
@@ -1254,6 +1445,7 @@ class ServerBotDaemon {
             side: pos.side === 'LONG' ? 'Sell' : 'Buy',
             orderType: 'Market',
             qtyBase: pos.qty,
+            exactQtyStr: this.positionRawSizeById[positionId],
             reduceOnly: category === 'linear',
             positionIdx: category === 'linear' ? (this.positionIdxById[positionId] ?? 0) : undefined,
             isSpotMargin: this.config.marketType === 'spot_margin',
@@ -1262,6 +1454,7 @@ class ServerBotDaemon {
         );
         delete this.positionOpenedAtById[positionId];
         delete this.positionIdxById[positionId];
+        delete this.positionRawSizeById[positionId];
         delete this.closeRetryAfterById[positionId];
         this.activePositions = this.activePositions.filter((p) => p.id !== positionId);
         this.recordClosedTrade(pos, exitPrice, reason, false);
@@ -1288,22 +1481,34 @@ class ServerBotDaemon {
     return { ok: true };
   }
 
-  public updateConfig(next: StrategyConfig, logMessage?: string) {
+  public updateConfig(
+    nextRaw: Partial<StrategyConfig>,
+    logMessage?: string
+  ): { ok: boolean; error?: string } {
+    const next = sanitizeStrategyConfig(nextRaw, this.config);
+    if (next.marketType !== this.config.marketType && this.activePositions.length > 0) {
+      return {
+        ok: false,
+        error: `Nie można zmienić typu rynku Bybit podczas gdy masz ${this.activePositions.length} otwartych pozycji. Najpierw zamknij pozycje.`,
+      };
+    }
+
     const tfChanged = next.timeframe !== this.config.timeframe;
     const marketChanged =
       next.marketType !== this.config.marketType || next.quoteCurrency !== this.config.quoteCurrency;
-    this.config = { ...next };
+    this.config = next;
     this.pushEvent({
       category: 'SYSTEM',
       tag: 'HOT-RELOAD',
       message:
         logMessage ||
-        `Zaktualizowano konfigurację strategii (Z-Score ${next.zScoreThreshold.toFixed(2)}σ, ADX max ${next.adxMax}).`,
+        `Zaktualizowano konfigurację strategii (Z-Score ${next.zScoreThreshold.toFixed(2)}σ, ADX max ${next.adxMax}, ${next.leverage}x).`,
     });
     this.schedulePersist();
     if (tfChanged || marketChanged) {
       void this.refreshKlines();
     }
+    return { ok: true };
   }
 
   public async setExecutionMode(
@@ -1358,7 +1563,9 @@ class ServerBotDaemon {
       this.orderMetaBySymbol = {};
       this.positionOpenedAtById = {};
       this.positionIdxById = {};
+      this.positionRawSizeById = {};
       this.closeRetryAfterById = {};
+      this.dailyLossGuardDate = null;
       this.lastClosedPnlSyncAt = 0;
       this.privateAccount = {
         equity: 0,
@@ -1386,6 +1593,7 @@ class ServerBotDaemon {
 
   public togglePauseBot(): BotRunState {
     this.botState = this.botState === 'RUNNING' ? 'PAUSED' : 'RUNNING';
+    this.dailyLossGuardDate = null;
     this.pushEvent({
       category: 'SYSTEM',
       tag: this.botState,
@@ -1400,6 +1608,7 @@ class ServerBotDaemon {
 
   public resumeFromKillSwitch(): BotRunState {
     this.botState = 'RUNNING';
+    this.dailyLossGuardDate = null;
     this.pushEvent({
       category: 'SYSTEM',
       tag: 'RUNNING',
@@ -1411,6 +1620,7 @@ class ServerBotDaemon {
 
   public async triggerKillSwitch(): Promise<{ ok: boolean; message: string }> {
     this.botState = 'HALTED';
+    this.dailyLossGuardDate = null;
     if (this.executionMode === 'exchange') {
       try {
         const res = await triggerBybitKillSwitch(this.privateEnv);
@@ -1456,6 +1666,7 @@ class ServerBotDaemon {
     this.paperEquity = DEFAULT_START_EQUITY;
     this.consecutiveLosses = 0;
     this.cooldownUntil = 0;
+    this.dailyLossGuardDate = null;
     this.pushEvent({
       category: 'SYSTEM',
       tag: 'RESET KONTA',
@@ -1476,16 +1687,69 @@ class ServerBotDaemon {
     return !exists;
   }
 
+  public setPausedPairsBatch(
+    bases: string[],
+    paused: boolean,
+    reasonLabel?: string
+  ): { changed: string[]; pausedPairs: string[] } {
+    const allowedSet = new Set(ALL_SCANNER_ASSETS);
+    const normalized = Array.from(
+      new Set(
+        bases
+          .filter((b): b is string => typeof b === 'string')
+          .map((b) => b.trim().toUpperCase())
+          .filter((b) => allowedSet.has(b))
+      )
+    );
+
+    const currentSet = new Set(this.config.pausedPairs);
+    const changed: string[] = [];
+
+    for (const base of normalized) {
+      if (paused) {
+        if (!currentSet.has(base)) {
+          currentSet.add(base);
+          changed.push(base);
+        }
+      } else {
+        if (currentSet.has(base)) {
+          currentSet.delete(base);
+          changed.push(base);
+        }
+      }
+    }
+
+    if (changed.length > 0) {
+      this.config = {
+        ...this.config,
+        pausedPairs: Array.from(currentSet),
+      };
+      const label = reasonLabel ? ` (${reasonLabel})` : '';
+      this.pushEvent({
+        category: 'SYSTEM',
+        tag: paused ? 'WSTRZYMANO PARY' : 'WZNOWIONO PARY',
+        message: paused
+          ? `Wstrzymano ${changed.length} par${label}: ${changed.join(', ')}. Otwarte pozycje pozostają pod ochroną SL/TP.`
+          : `Włączono ponownie ${changed.length} par${label}: ${changed.join(', ')}.`,
+      });
+      this.schedulePersist();
+    }
+
+    return {
+      changed,
+      pausedPairs: [...this.config.pausedPairs],
+    };
+  }
+
   private getActiveClosedTrades(): ClosedTrade[] {
     return this.executionMode === 'exchange' ? this.exchangeClosedTrades : this.closedTrades;
   }
 
   private getTodayRealizedPnl(): number {
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
-    const ts = startOfDay.getTime();
+    const now = new Date();
+    const utcStartOfDay = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
     return this.getActiveClosedTrades()
-      .filter((t) => t.closedAt >= ts)
+      .filter((t) => t.closedAt >= utcStartOfDay)
       .reduce((acc, t) => acc + t.netPnlUsd, 0);
   }
 
@@ -1496,12 +1760,20 @@ class ServerBotDaemon {
     return this.activePositions.reduce((acc, p) => acc + p.unrealizedPnlUsd, 0);
   }
 
+  private getWalletBalance(): number {
+    return this.executionMode === 'exchange' ? this.privateAccount.walletBalance : this.paperEquity;
+  }
+
+  // Consistent Total Equity (Wallet + Unrealized PnL) across BOTH Paper and Exchange modes
   private getEffectiveEquity(): number {
-    return this.executionMode === 'exchange' ? this.privateAccount.equity : this.paperEquity;
+    if (this.executionMode === 'exchange') {
+      return this.privateAccount.equity;
+    }
+    return this.paperEquity + this.getUnrealizedPnl();
   }
 
   private getDrawdownPct(): number {
-    const eq = this.getEffectiveEquity();
+    const eq = this.getWalletBalance() > 0 ? this.getWalletBalance() : this.getEffectiveEquity();
     const totalToday = this.getTodayRealizedPnl() + this.getUnrealizedPnl();
     if (totalToday >= 0 || eq <= 0) return 0;
     return (totalToday / eq) * 100;
@@ -1517,6 +1789,8 @@ class ServerBotDaemon {
       accounts: getAllBybitAccountsStatus(),
     };
 
+    const walletBalance = this.getWalletBalance();
+    const unrealizedPnl = this.getUnrealizedPnl();
     const equity = this.getEffectiveEquity();
     const totalNotional = this.activePositions.reduce((acc, p) => acc + p.notionalUsd, 0);
     const usedMargin = this.activePositions.reduce(
@@ -1535,8 +1809,10 @@ class ServerBotDaemon {
       marketError: this.lastMarketError,
       networkDiagnostics: getBybitNetworkDiagnostics(),
       botState: this.botState,
+      dailyLossGuardDate: this.dailyLossGuardDate,
       executionMode: this.executionMode,
       config: this.config,
+      walletBalance,
       equity,
       startingEquity:
         this.executionMode === 'exchange'
@@ -1544,7 +1820,7 @@ class ServerBotDaemon {
           : DEFAULT_START_EQUITY,
       availableBalance,
       todayRealizedPnl: this.getTodayRealizedPnl(),
-      unrealizedPnl: this.getUnrealizedPnl(),
+      unrealizedPnl,
       effectiveLeverage: equity > 0 ? totalNotional / equity : 0,
       drawdownPct: this.getDrawdownPct(),
       activePositions: this.activePositions,

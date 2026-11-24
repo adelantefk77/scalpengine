@@ -311,6 +311,7 @@ export const ALL_SCANNER_ASSETS = [
   'ENA',
   'WLD',
   'HBAR',
+  'FARTCOIN',
 ];
 
 export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {

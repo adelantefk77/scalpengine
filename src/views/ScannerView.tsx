@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   CandlestickChart,
@@ -9,6 +10,7 @@ import {
   Search,
   Zap,
 } from 'lucide-react';
+import { LosingPairsToggleButton } from '../components/LosingPairsToggleButton';
 import { useBot } from '../engine/botContext';
 import { formatPrice, formatUsd } from '../engine/format';
 import { MarketType, PairTelemetry } from '../engine/types';
@@ -17,6 +19,10 @@ export const ScannerView: React.FC = () => {
   const {
     config,
     updateConfig,
+    executionMode,
+    privateStatus,
+    equity,
+    activePositions,
     pairTelemetries,
     selectedPairBase,
     setSelectedPairBase,
@@ -29,8 +35,17 @@ export const ScannerView: React.FC = () => {
     showToast,
   } = useBot();
 
-  const [filterTab, setFilterTab] = useState<'all' | 'signal' | 'position' | 'adx'>('all');
+  const [filterTab, setFilterTab] = useState<'all' | 'signal' | 'position' | 'adx' | 'paused'>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [submittingSide, setSubmittingSide] = useState<'LONG' | 'SHORT' | null>(null);
+  const [confirmLiveOrder, setConfirmLiveOrder] = useState<{
+    base: string;
+    displayPair: string;
+    side: 'LONG' | 'SHORT';
+    price: number;
+  } | null>(null);
+
+  const isRealMainnet = executionMode === 'exchange' && privateStatus.env === 'mainnet';
 
   const counts = useMemo(() => {
     const signal = pairTelemetries.filter((p) =>
@@ -40,8 +55,9 @@ export const ScannerView: React.FC = () => {
       ['IN_POSITION_LONG', 'IN_POSITION_SHORT'].includes(p.status)
     ).length;
     const adx = pairTelemetries.filter((p) => p.status === 'BLOCKED_ADX' || p.status === 'BLOCKED_ATR').length;
-    return { all: pairTelemetries.length, signal, position, adx };
-  }, [pairTelemetries]);
+    const paused = pairTelemetries.filter((p) => config.pausedPairs.includes(p.base)).length;
+    return { all: pairTelemetries.length, signal, position, adx, paused };
+  }, [pairTelemetries, config.pausedPairs]);
 
   const filteredPairs = useMemo(() => {
     const q = searchQuery.trim().toUpperCase();
@@ -56,9 +72,12 @@ export const ScannerView: React.FC = () => {
       if (filterTab === 'adx') {
         return p.status === 'BLOCKED_ADX' || p.status === 'BLOCKED_ATR';
       }
+      if (filterTab === 'paused') {
+        return config.pausedPairs.includes(p.base);
+      }
       return true;
     });
-  }, [pairTelemetries, searchQuery, filterTab]);
+  }, [pairTelemetries, searchQuery, filterTab, config.pausedPairs]);
 
   const selectedPair: PairTelemetry | undefined = useMemo(() => {
     return (
@@ -68,9 +87,44 @@ export const ScannerView: React.FC = () => {
     );
   }, [pairTelemetries, filteredPairs, selectedPairBase]);
 
-  const switchMarket = (marketType: MarketType) => {
-    updateConfig({ ...config, marketType }, `Zmieniono rynek na ${marketType}`);
-    showToast('Przełączono kategorię rynku Bybit — odświeżanie danych...', 'success');
+  const switchMarket = async (marketType: MarketType) => {
+    if (marketType === config.marketType) return;
+    if (activePositions.length > 0) {
+      showToast(
+        `Zamknij najpierw ${activePositions.length} otwartych pozycji przed zmianą kategorii rynku Bybit.`,
+        'warning'
+      );
+      return;
+    }
+    const ok = await updateConfig({ ...config, marketType }, `Zmieniono rynek na ${marketType}`);
+    if (ok) {
+      showToast('Przełączono kategorię rynku Bybit — odświeżanie danych...', 'success');
+    }
+  };
+
+  const executeManualOrder = async (base: string, side: 'LONG' | 'SHORT') => {
+    if (submittingSide) return;
+    setSubmittingSide(side);
+    try {
+      await forceMakerOrder(base, side);
+    } finally {
+      setSubmittingSide(null);
+      setConfirmLiveOrder(null);
+    }
+  };
+
+  const handleManualOrderClick = (pair: PairTelemetry, side: 'LONG' | 'SHORT') => {
+    if (submittingSide) return;
+    if (isRealMainnet) {
+      setConfirmLiveOrder({
+        base: pair.base,
+        displayPair: pair.displayPair,
+        side,
+        price: side === 'LONG' ? pair.bidPrice : pair.askPrice,
+      });
+      return;
+    }
+    void executeManualOrder(pair.base, side);
   };
 
   // Build SVG Candlestick Chart data from real Bybit series (last 48 candles)
@@ -157,6 +211,7 @@ export const ScannerView: React.FC = () => {
                 { id: 'signal', label: 'Blisko sygnału', count: counts.signal },
                 { id: 'position', label: 'Pozycje aktywne', count: counts.position },
                 { id: 'adx', label: 'Zablokowane ADX', count: counts.adx },
+                { id: 'paused', label: 'Wstrzymane', count: counts.paused },
               ] as const
             ).map((tab) => (
               <button
@@ -199,7 +254,9 @@ export const ScannerView: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center gap-2.5 justify-end">
+        <div className="flex flex-wrap items-center gap-2 justify-end">
+          <LosingPairsToggleButton size="sm" />
+
           <div className="relative flex items-center">
             <Search className="w-4 h-4 absolute left-2.5 text-on-surface-variant pointer-events-none" />
             <input
@@ -207,7 +264,7 @@ export const ScannerView: React.FC = () => {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Szukaj monety (SOL, BTC, SUI)..."
-              className="bg-surface-container-lowest text-on-surface placeholder:text-on-surface-variant font-mono text-xs pl-8 pr-3 py-1.5 rounded-lg border border-white/5 focus:outline-none focus:border-primary/50 w-48 sm:w-60"
+              className="bg-surface-container-lowest text-on-surface placeholder:text-on-surface-variant font-mono text-xs pl-8 pr-3 py-1.5 rounded-lg border border-white/5 focus:outline-none focus:border-primary/50 w-44 sm:w-52"
             />
           </div>
 
@@ -455,19 +512,21 @@ export const ScannerView: React.FC = () => {
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => forceMakerOrder(selectedPair.base, 'LONG')}
-                className="px-3 py-1.5 rounded-lg bg-tertiary text-on-tertiary hover:bg-tertiary-fixed font-mono text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors whitespace-nowrap"
+                disabled={Boolean(submittingSide)}
+                onClick={() => handleManualOrderClick(selectedPair, 'LONG')}
+                className="px-3 py-1.5 rounded-lg bg-tertiary text-on-tertiary hover:bg-tertiary-fixed font-mono text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors whitespace-nowrap disabled:opacity-50"
               >
                 <Zap className="w-3.5 h-3.5" />
-                <span>Maker LONG</span>
+                <span>{submittingSide === 'LONG' ? 'Wysyłanie...' : 'Maker LONG'}</span>
               </button>
               <button
                 type="button"
-                onClick={() => forceMakerOrder(selectedPair.base, 'SHORT')}
-                className="px-3 py-1.5 rounded-lg bg-error-container text-on-error-container hover:bg-error hover:text-on-error font-mono text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors whitespace-nowrap"
+                disabled={Boolean(submittingSide)}
+                onClick={() => handleManualOrderClick(selectedPair, 'SHORT')}
+                className="px-3 py-1.5 rounded-lg bg-error-container text-on-error-container hover:bg-error hover:text-on-error font-mono text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors whitespace-nowrap disabled:opacity-50"
               >
                 <Zap className="w-3.5 h-3.5" />
-                <span>Maker SHORT</span>
+                <span>{submittingSide === 'SHORT' ? 'Wysyłanie...' : 'Maker SHORT'}</span>
               </button>
             </div>
           </div>
@@ -622,6 +681,76 @@ export const ScannerView: React.FC = () => {
                   />
                 </svg>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* REAL Mainnet Manual Order Confirmation Modal */}
+      {confirmLiveOrder && (
+        <div className="fixed inset-0 z-[70] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-surface-container-high border border-error/40 rounded-xl max-w-md w-full p-5 shadow-2xl flex flex-col gap-4">
+            <div className="flex items-center gap-3 text-error">
+              <AlertTriangle className="w-6 h-6 shrink-0" />
+              <h3 className="font-display text-base font-bold">
+                Potwierdź Zlecenie na BYBIT REAL LIVE
+              </h3>
+            </div>
+            <p className="text-xs text-on-surface leading-relaxed">
+              Wysyłasz ręczne zlecenie <strong>Limit Post-Only</strong> na prawdziwym koncie{' '}
+              <strong className="text-error">Bybit REAL Mainnet</strong>:
+            </p>
+            <div className="bg-surface-container-lowest rounded-lg p-3 font-mono text-xs flex flex-col gap-1.5 tabular-nums border border-white/5">
+              <div className="flex justify-between">
+                <span className="text-on-surface-variant">Instrument:</span>
+                <span className="font-bold text-on-surface">{confirmLiveOrder.displayPair}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-on-surface-variant">Kierunek &amp; Dźwignia:</span>
+                <span
+                  className={
+                    confirmLiveOrder.side === 'LONG' ? 'text-tertiary font-bold' : 'text-error font-bold'
+                  }
+                >
+                  {confirmLiveOrder.side} {config.leverage}x
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-on-surface-variant">Cena Limit (Bid/Ask):</span>
+                <span className="text-on-surface font-semibold">{formatPrice(confirmLiveOrder.price)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-on-surface-variant">Szac. wartość (Notional):</span>
+                <span className="text-primary font-bold">
+                  {formatUsd(
+                    config.sizingMode === 'percent'
+                      ? Math.max(25, Math.max(100, equity) * (config.positionPercent / 100) * config.leverage)
+                      : Math.max(25, Math.min(Math.max(100, equity) * 0.5, config.positionFixedUsd / Math.max(1, config.leverage)) * config.leverage)
+                  )}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={Boolean(submittingSide)}
+                onClick={() => setConfirmLiveOrder(null)}
+                className="px-3.5 py-2 rounded-lg bg-surface-container hover:bg-surface-container-highest text-on-surface text-xs font-semibold"
+              >
+                Anuluj
+              </button>
+              <button
+                type="button"
+                disabled={Boolean(submittingSide)}
+                onClick={() => void executeManualOrder(confirmLiveOrder.base, confirmLiveOrder.side)}
+                className={`px-4 py-2 rounded-lg font-mono text-xs font-bold uppercase disabled:opacity-50 ${
+                  confirmLiveOrder.side === 'LONG'
+                    ? 'bg-tertiary text-on-tertiary hover:bg-tertiary-fixed'
+                    : 'bg-error text-on-error hover:opacity-90'
+                }`}
+              >
+                {submittingSide ? 'Wysyłanie...' : `Wyślij REAL ${confirmLiveOrder.side}`}
+              </button>
             </div>
           </div>
         </div>

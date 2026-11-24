@@ -204,7 +204,21 @@ interface CacheEntry<T> {
   expiresAt: number;
 }
 
+const MAX_CACHE_ENTRIES = 500;
 const cache = new Map<string, CacheEntry<unknown>>();
+
+function pruneMarketCache(now: number) {
+  for (const [key, entry] of cache.entries()) {
+    if (entry.expiresAt <= now) {
+      cache.delete(key);
+    }
+  }
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (!oldestKey) break;
+    cache.delete(oldestKey);
+  }
+}
 
 export async function fetchBybitJson<T>(
   endpointPath: string,
@@ -214,6 +228,9 @@ export async function fetchBybitJson<T>(
   const cached = cache.get(endpointPath);
   if (cached && cached.expiresAt > now) {
     return { data: cached.data as T, latencyMs: 1, host: 'cache' };
+  }
+  if (cached) {
+    cache.delete(endpointPath);
   }
 
   const hosts = getPublicBybitHosts();
@@ -257,6 +274,9 @@ export async function fetchBybitJson<T>(
       hostCooldownUntil.delete(host);
       lastWorkingPublicHost = host;
       const latencyMs = Date.now() - start;
+      if (cache.size >= MAX_CACHE_ENTRIES) {
+        pruneMarketCache(Date.now());
+      }
       cache.set(endpointPath, { data: json, expiresAt: Date.now() + cacheTtlMs });
       return { data: json as T, latencyMs, host };
     } catch (err) {
@@ -268,11 +288,44 @@ export async function fetchBybitJson<T>(
   throw lastError instanceof Error ? lastError : new Error('Failed to fetch from Bybit API');
 }
 
+let bybitTimeOffsetMs = 0;
+let lastBybitTimeSyncAt = 0;
+
+export async function syncBybitServerTime(force = false): Promise<number> {
+  const now = Date.now();
+  if (!force && lastBybitTimeSyncAt > 0 && now - lastBybitTimeSyncAt < 10 * 60 * 1000) {
+    return bybitTimeOffsetMs;
+  }
+  try {
+    const t0 = Date.now();
+    const { data } = await fetchBybitJson<{
+      result?: { timeSecond?: string; timeNano?: string };
+      time?: number;
+    }>('/v5/market/time', force ? 0 : 10000);
+    const t1 = Date.now();
+    const serverMs =
+      data?.result?.timeNano
+        ? Math.floor(Number(data.result.timeNano) / 1e6)
+        : data?.result?.timeSecond
+          ? Number(data.result.timeSecond) * 1000
+          : Number(data?.time || 0);
+    if (Number.isFinite(serverMs) && serverMs > 1_600_000_000_000) {
+      const localMid = Math.floor((t0 + t1) / 2);
+      bybitTimeOffsetMs = serverMs - localMid;
+      lastBybitTimeSyncAt = t1;
+    }
+  } catch {
+    // keep existing offset on transient failure
+  }
+  return bybitTimeOffsetMs;
+}
+
 export async function signedBybitRequest<T>(
   method: 'GET' | 'POST',
   apiPath: string,
   params: Record<string, unknown> = {},
-  targetEnv?: BybitEnv
+  targetEnv?: BybitEnv,
+  allowTimeRetry = true
 ): Promise<T> {
   const cfg = getBybitEnvConfig(targetEnv);
   if (!cfg.configured) {
@@ -283,7 +336,11 @@ export async function signedBybitRequest<T>(
     throw new Error(`Brak kluczy ${varHint} w zmiennych środowiskowych serwera.`);
   }
 
-  const timestamp = Date.now().toString();
+  if (lastBybitTimeSyncAt === 0) {
+    await syncBybitServerTime(false);
+  }
+
+  const timestamp = String(Date.now() + bybitTimeOffsetMs);
   const recvWindow = (process.env.BYBIT_RECV_WINDOW || '5000').trim() || '5000';
 
   let queryString = '';
@@ -351,6 +408,11 @@ export async function signedBybitRequest<T>(
     }
 
     if (typeof json.retCode === 'number' && json.retCode !== 0) {
+      // Auto-resync Bybit clock on timestamp drift (retCode 10002) and retry once
+      if (json.retCode === 10002 && allowTimeRetry) {
+        await syncBybitServerTime(true);
+        return signedBybitRequest<T>(method, apiPath, params, targetEnv, false);
+      }
       throw new Error(`Bybit [${json.retCode}]: ${json.retMsg || 'Unknown error'}`);
     }
     return json as unknown as T;
@@ -363,6 +425,7 @@ export interface InstrumentFilters {
   tickSize: string;
   qtyStep: string;
   minOrderQty: string;
+  minNotionalValue: string;
 }
 
 function decimalsFromStep(stepStr: string): number {
@@ -402,6 +465,8 @@ export async function getInstrumentFilters(
           qtyStep?: string;
           basePrecision?: string;
           minOrderQty?: string;
+          minNotionalValue?: string;
+          minOrderAmt?: string;
         };
       }>;
     };
@@ -412,7 +477,9 @@ export async function getInstrumentFilters(
   const qtyStep =
     info?.lotSizeFilter?.qtyStep || info?.lotSizeFilter?.basePrecision || '0.001';
   const minOrderQty = info?.lotSizeFilter?.minOrderQty || qtyStep;
-  return { tickSize, qtyStep, minOrderQty };
+  const minNotionalValue =
+    info?.lotSizeFilter?.minNotionalValue || info?.lotSizeFilter?.minOrderAmt || '5';
+  return { tickSize, qtyStep, minOrderQty, minNotionalValue };
 }
 
 export interface PrivateOrderPayload {
@@ -422,6 +489,7 @@ export interface PrivateOrderPayload {
   orderType: 'Limit' | 'Market';
   qtyUsd?: number;
   qtyBase?: number;
+  exactQtyStr?: string;
   price?: number;
   postOnly?: boolean;
   leverage?: number;
@@ -452,6 +520,7 @@ export async function placeBybitOrder(
     orderType = 'Limit',
     qtyUsd,
     qtyBase,
+    exactQtyStr,
     price,
     postOnly = true,
     leverage,
@@ -469,6 +538,7 @@ export async function placeBybitOrder(
   const filters = await getInstrumentFilters(category, symbol);
 
   if (category === 'linear' && !reduceOnly && leverage && leverage >= 1) {
+    const safeLev = Math.min(10, Math.max(1, Math.round(leverage)));
     try {
       await signedBybitRequest(
         'POST',
@@ -476,8 +546,8 @@ export async function placeBybitOrder(
         {
           category: 'linear',
           symbol,
-          buyLeverage: String(leverage),
-          sellLeverage: String(leverage),
+          buyLeverage: String(safeLev),
+          sellLeverage: String(safeLev),
         },
         targetEnv
       );
@@ -497,16 +567,43 @@ export async function placeBybitOrder(
     referencePrice = Number(tickData?.result?.list?.[0]?.lastPrice || 0);
   }
 
-  let rawQty = Number(qtyBase || 0);
-  if ((!Number.isFinite(rawQty) || rawQty <= 0) && qtyUsd && referencePrice > 0) {
-    rawQty = qtyUsd / referencePrice;
-  }
-  if (!Number.isFinite(rawQty) || rawQty <= 0) {
-    throw new Error('Nieprawidłowa ilość zlecenia.');
-  }
+  let formattedQty = '';
+  if (reduceOnly && exactQtyStr && Number(exactQtyStr) > 0) {
+    formattedQty = exactQtyStr.trim();
+  } else {
+    let rawQty = Number(qtyBase || 0);
+    if ((!Number.isFinite(rawQty) || rawQty <= 0) && qtyUsd && referencePrice > 0) {
+      rawQty = qtyUsd / referencePrice;
+    }
+    if (!Number.isFinite(rawQty) || rawQty <= 0) {
+      throw new Error('Nieprawidłowa ilość zlecenia.');
+    }
 
-  const minQty = Number(filters.minOrderQty);
-  const formattedQty = roundToStep(Math.max(rawQty, minQty), filters.qtyStep, 'floor');
+    const minQty = Number(filters.minOrderQty);
+    const minNotional = Number(filters.minNotionalValue || 5);
+    formattedQty = roundToStep(rawQty, filters.qtyStep, 'floor');
+    const numericQty = Number(formattedQty);
+
+    if (!Number.isFinite(numericQty) || numericQty <= 0) {
+      throw new Error(
+        `Ilość zlecenia dla ${symbol} po zaokrągleniu do kroku (${filters.qtyStep}) wynosi 0 — zwiększ kapitał lub rozmiar pozycji.`
+      );
+    }
+
+    if (!reduceOnly) {
+      if (Number.isFinite(minQty) && minQty > 0 && numericQty < minQty) {
+        throw new Error(
+          `Rozmiar zlecenia (${numericQty} ${symbol}) poniżej minimum giełdy Bybit (${minQty}). Zlecenie odrzucone dla ochrony ryzyka.`
+        );
+      }
+      const orderNotional = numericQty * referencePrice;
+      if (Number.isFinite(minNotional) && minNotional > 0 && referencePrice > 0 && orderNotional < minNotional) {
+        throw new Error(
+          `Wartość zlecenia ($${orderNotional.toFixed(2)}) poniżej minimum Bybit ($${minNotional.toFixed(2)}) dla ${symbol}.`
+        );
+      }
+    }
+  }
 
   const orderPayload: Record<string, unknown> = {
     category,

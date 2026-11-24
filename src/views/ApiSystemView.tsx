@@ -14,6 +14,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
+import { apiFetch } from '../engine/apiClient';
 import { useBot } from '../engine/botContext';
 import { formatTimeHms, formatUsd } from '../engine/format';
 import { PrivateEnv } from '../engine/types';
@@ -79,7 +80,7 @@ export const ApiSystemView: React.FC = () => {
   const testHealth = async () => {
     setTestingHealth(true);
     try {
-      const res = await fetch('/api/health');
+      const res = await apiFetch('/api/health');
       const data = await res.json();
       setHealthInfo(data);
       await refreshMarketData();
@@ -640,7 +641,7 @@ BYBIT_LIVE_API_SECRET="TWOJ_SEKRET_REAL"`}
           </div>
           <button
             type="button"
-            onClick={resetPaperAccount}
+            onClick={() => void resetPaperAccount()}
             className="w-full px-3 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-on-surface font-mono text-xs font-bold flex items-center justify-center gap-2 transition-colors"
           >
             <RotateCcw className="w-3.5 h-3.5" />

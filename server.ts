@@ -8,6 +8,8 @@ import {
   handleLogoutRequest,
   isAuthEnabled,
   requireAuthMiddleware,
+  requireCsrfProtection,
+  securityHeadersMiddleware,
 } from './serverAuth';
 import { serverBot } from './serverBot';
 import {
@@ -31,7 +33,8 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(express.json());
+  app.use(securityHeadersMiddleware);
+  app.use(express.json({ limit: '256kb' }));
 
   // Start autonomous 24/7 server-side trading engine immediately
   serverBot.start();
@@ -83,11 +86,11 @@ async function startServer() {
     res.json({ ok: true, ...getAuthStatusFromRequest(req) });
   });
 
-  app.post('/api/auth/login', handleLoginRequest);
-  app.post('/api/auth/logout', handleLogoutRequest);
+  app.post('/api/auth/login', requireCsrfProtection, handleLoginRequest);
+  app.post('/api/auth/logout', requireCsrfProtection, handleLogoutRequest);
 
-  // Protect all trading daemon & Bybit proxy endpoints when APP_PASSWORD is set
-  app.use(['/api/bot', '/api/bybit'], requireAuthMiddleware);
+  // Protect all trading daemon & Bybit proxy endpoints when APP_PASSWORD is set + enforce CSRF/Origin guard on mutations
+  app.use(['/api/bot', '/api/bybit'], requireAuthMiddleware, requireCsrfProtection);
 
   // =========================================================================
   // 24/7 Autonomous Bot Daemon Control & Telemetry API
@@ -99,15 +102,15 @@ async function startServer() {
 
   app.post('/api/bot/config', (req, res) => {
     const { config, logMessage } = req.body as {
-      config?: StrategyConfig;
+      config?: Partial<StrategyConfig>;
       logMessage?: string;
     };
-    if (!config || !Array.isArray(config.activePairs)) {
+    if (!config || typeof config !== 'object' || !Array.isArray(config.activePairs)) {
       res.status(400).json({ ok: false, error: 'Nieprawidłowy obiekt konfiguracji strategii.' });
       return;
     }
-    serverBot.updateConfig(config, logMessage);
-    res.json({ ok: true, ...serverBot.getSnapshot() });
+    const result = serverBot.updateConfig(config, logMessage);
+    res.status(result.ok ? 200 : 400).json({ ...result, ...serverBot.getSnapshot() });
   });
 
   app.post('/api/bot/mode', async (req, res) => {
@@ -132,9 +135,12 @@ async function startServer() {
   });
 
   app.post('/api/bot/control', async (req, res) => {
-    const { action, base } = req.body as {
+    const { action, base, bases, paused, reason } = req.body as {
       action?: string;
       base?: string;
+      bases?: unknown;
+      paused?: unknown;
+      reason?: string;
     };
 
     switch (action) {
@@ -166,8 +172,22 @@ async function startServer() {
           res.status(400).json({ ok: false, error: 'Brak parametru base.' });
           return;
         }
-        const paused = serverBot.togglePausePair(base);
-        res.json({ ok: true, paused, ...serverBot.getSnapshot() });
+        const isPaused = serverBot.togglePausePair(base);
+        res.json({ ok: true, paused: isPaused, ...serverBot.getSnapshot() });
+        return;
+      }
+      case 'set_paused_pairs': {
+        if (!Array.isArray(bases) || typeof paused !== 'boolean') {
+          res.status(400).json({ ok: false, error: 'Nieprawidłowe parametry listy par lub flagi paused.' });
+          return;
+        }
+        const safeBases = bases.filter((item): item is string => typeof item === 'string');
+        const result = serverBot.setPausedPairsBatch(
+          safeBases,
+          paused,
+          typeof reason === 'string' ? reason.slice(0, 60) : undefined
+        );
+        res.json({ ok: true, ...result, ...serverBot.getSnapshot() });
         return;
       }
       case 'refresh_private': {
@@ -374,7 +394,25 @@ async function startServer() {
 
   app.post('/api/bybit/private/order', async (req, res) => {
     try {
-      const result = await placeBybitOrder(req.body as PrivateOrderPayload, serverBot.getPrivateEnv());
+      const payload = req.body as Partial<PrivateOrderPayload>;
+      if (
+        !payload ||
+        typeof payload.symbol !== 'string' ||
+        !/^[A-Z0-9]{4,20}$/.test(payload.symbol) ||
+        (payload.side !== 'Buy' && payload.side !== 'Sell') ||
+        (payload.category !== 'linear' && payload.category !== 'spot')
+      ) {
+        res.status(400).json({ ok: false, error: 'Nieprawidłowe parametry zlecenia giełdowego.' });
+        return;
+      }
+      const safeLeverage =
+        payload.leverage !== undefined
+          ? Math.min(10, Math.max(1, Math.round(Number(payload.leverage) || 1)))
+          : undefined;
+      const result = await placeBybitOrder(
+        { ...(payload as PrivateOrderPayload), leverage: safeLeverage },
+        serverBot.getPrivateEnv()
+      );
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(400).json({
@@ -391,6 +429,10 @@ async function startServer() {
         symbol: string;
         orderId: string;
       };
+      if (!symbol || !orderId || (category !== 'linear' && category !== 'spot')) {
+        res.status(400).json({ ok: false, error: 'Brak wymaganych parametrów do anulowania zlecenia.' });
+        return;
+      }
       const result = await cancelBybitOrder(category, symbol, orderId, serverBot.getPrivateEnv());
       res.json({ ok: true, result });
     } catch (err) {
@@ -430,12 +472,27 @@ async function startServer() {
   }
 
   const port = Number(process.env.PORT) || 3000;
-  app.listen(port, '0.0.0.0', () => {
+  const httpServer = app.listen(port, '0.0.0.0', () => {
     const envCfg = getBybitEnvConfig();
     console.log(
       `ScalpEngine 24/7 server listening on http://0.0.0.0:${port} (Bybit Private Env: ${envCfg.env.toUpperCase()}, API Keys: ${envCfg.configured ? 'CONFIGURED' : 'NOT SET'})`
     );
   });
+
+  let shuttingDown = false;
+  const handleShutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`ScalpEngine received ${signal} — flushing bot state to disk...`);
+    serverBot.flushPersistNow();
+    httpServer.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 2500).unref();
+  };
+
+  process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+  process.on('SIGINT', () => handleShutdown('SIGINT'));
 }
 
 startServer();

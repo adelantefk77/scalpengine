@@ -330,7 +330,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               {botState === 'HALTED' ? (
                 <button
                   type="button"
-                  onClick={resumeFromKillSwitch}
+                  onClick={() => void resumeFromKillSwitch()}
                   title="Wznów silnik"
                   className="px-2.5 py-1.5 rounded-lg bg-tertiary text-on-tertiary hover:bg-tertiary-fixed font-sans text-xs font-bold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                 >
@@ -340,7 +340,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               ) : (
                 <button
                   type="button"
-                  onClick={togglePauseBot}
+                  onClick={() => void togglePauseBot()}
                   title={botState === 'RUNNING' ? 'Pauza bota' : 'Wznów bota'}
                   className="px-2.5 py-1.5 rounded-lg bg-surface-container-high text-on-surface hover:bg-surface-container-highest font-sans text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                 >
@@ -545,7 +545,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               <button
                 type="button"
                 onClick={() => {
-                  triggerKillSwitch();
+                  void triggerKillSwitch();
                   setKillModalOpen(false);
                 }}
                 className="px-4 py-2 rounded-lg bg-error-container hover:bg-error text-on-error-container hover:text-on-error font-mono text-xs font-bold uppercase tracking-wider transition-colors"

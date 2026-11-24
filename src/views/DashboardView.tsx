@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   CandlestickChart,
@@ -15,6 +15,7 @@ import { BotEventCategory } from '../engine/types';
 
 export const DashboardView: React.FC = () => {
   const {
+    walletBalance,
     equity,
     startingEquity,
     availableBalance,
@@ -22,6 +23,7 @@ export const DashboardView: React.FC = () => {
     unrealizedPnl,
     effectiveLeverage,
     drawdownPct,
+    dailyLossGuardDate,
     config,
     activePositions,
     pendingOrders,
@@ -38,13 +40,54 @@ export const DashboardView: React.FC = () => {
   const [showCumFees, setShowCumFees] = useState(true);
   const [feedFilter, setFeedFilter] = useState<'ALL' | 'SIGNAL' | 'FILL' | 'WARNING'>('ALL');
   const [autoScroll, setAutoScroll] = useState(true);
+  const [now, setNow] = useState<number>(() => Date.now());
+  const [closingIds, setClosingIds] = useState<Record<string, boolean>>({});
+  const [cancellingIds, setCancellingIds] = useState<Record<string, boolean>>({});
+  const feedScrollRef = useRef<HTMLDivElement | null>(null);
 
-  const now = Date.now();
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (autoScroll && feedScrollRef.current) {
+      feedScrollRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  }, [events.length, autoScroll, feedFilter]);
+
+  const handleClosePosition = async (positionId: string) => {
+    if (closingIds[positionId]) return;
+    setClosingIds((prev) => ({ ...prev, [positionId]: true }));
+    try {
+      await closePositionMarket(positionId);
+    } finally {
+      setClosingIds((prev) => {
+        const next = { ...prev };
+        delete next[positionId];
+        return next;
+      });
+    }
+  };
+
+  const handleCancelOrder = async (orderId: string) => {
+    if (cancellingIds[orderId]) return;
+    setCancellingIds((prev) => ({ ...prev, [orderId]: true }));
+    try {
+      await cancelPendingOrder(orderId);
+    } finally {
+      setCancellingIds((prev) => {
+        const next = { ...prev };
+        delete next[orderId];
+        return next;
+      });
+    }
+  };
 
   // Win rate stats
   const scopedTrades = useMemo(() => {
     if (winRateScope === 'today') {
-      const sod = new Date();
+      const sod = new Date(now);
       sod.setHours(0, 0, 0, 0);
       return closedTrades.filter((t) => t.closedAt >= sod.getTime());
     }
@@ -76,7 +119,7 @@ export const DashboardView: React.FC = () => {
     };
   }, [closedTrades, config.postOnly]);
 
-  // Equity curve points from real closedTrades
+  // Equity curve points from real closedTrades (uses realized walletBalance baseline + Total Equity endpoint)
   const equityCurve = useMemo(() => {
     const cutoff =
       chartWindow === '24H'
@@ -92,9 +135,10 @@ export const DashboardView: React.FC = () => {
       .sort((a, b) => a.closedAt - b.closedAt)
       .filter((t) => t.closedAt >= cutoff);
 
-    // Reconstruct running equity backwards from current equity if trades exist
+    // Reconstruct running realized equity backwards from current walletBalance
     const totalWindowNet = sorted.reduce((acc, t) => acc + t.netPnlUsd, 0);
-    let runningEq = equity - totalWindowNet;
+    const realizedNow = walletBalance > 0 ? walletBalance : equity - unrealizedPnl;
+    let runningEq = realizedNow - totalWindowNet;
     let runningFees = 0;
 
     const pts: Array<{ time: number; equity: number; cumFees: number }> = [
@@ -105,9 +149,9 @@ export const DashboardView: React.FC = () => {
       runningFees += t.feesUsd;
       pts.push({ time: t.closedAt, equity: runningEq, cumFees: runningFees });
     }
-    pts.push({ time: now, equity: equity + unrealizedPnl, cumFees: runningFees });
+    pts.push({ time: now, equity, cumFees: runningFees });
     return pts;
-  }, [closedTrades, chartWindow, equity, unrealizedPnl, now]);
+  }, [closedTrades, chartWindow, walletBalance, equity, unrealizedPnl, now]);
 
   const highWaterMark = useMemo(() => {
     return Math.max(startingEquity, ...equityCurve.map((p) => p.equity));
@@ -179,7 +223,7 @@ export const DashboardView: React.FC = () => {
           </div>
           <div className="my-2">
             <div className="font-mono text-2xl font-bold text-on-surface tracking-tight tabular-nums">
-              {formatUsd(equity + unrealizedPnl)}
+              {formatUsd(equity)}
             </div>
           </div>
           <div className="flex flex-col gap-1 font-mono text-[11px] text-on-surface-variant tabular-nums">
@@ -321,10 +365,14 @@ export const DashboardView: React.FC = () => {
             </span>
             <span
               className={`font-mono text-[10px] font-bold uppercase tracking-wider ${
-                ddProgressPct >= 80 ? 'text-error' : 'text-tertiary'
+                dailyLossGuardDate || ddProgressPct >= 80 ? 'text-error' : 'text-tertiary'
               }`}
             >
-              {ddProgressPct >= 80 ? 'OSTRZEŻENIE' : 'BEZPIECZNIK OK'}
+              {dailyLossGuardDate
+                ? 'PAUZA DO 00:00 UTC'
+                : ddProgressPct >= 80
+                  ? 'OSTRZEŻENIE'
+                  : 'BEZPIECZNIK OK'}
             </span>
           </div>
           <div className="my-2">
@@ -339,7 +387,7 @@ export const DashboardView: React.FC = () => {
             <div className="h-2 w-full bg-surface-container rounded-full overflow-hidden flex">
               <div
                 className={`h-full transition-all duration-300 rounded-full ${
-                  ddProgressPct >= 75 ? 'bg-error' : 'bg-tertiary'
+                  dailyLossGuardDate || ddProgressPct >= 75 ? 'bg-error' : 'bg-tertiary'
                 }`}
                 style={{ width: `${Math.max(4, ddProgressPct)}%` }}
               />
@@ -347,7 +395,9 @@ export const DashboardView: React.FC = () => {
           </div>
           <div className="flex justify-between items-center font-mono text-[11px] text-on-surface-variant tabular-nums">
             <span>Status limitu:</span>
-            <span className="text-tertiary font-bold">{ddRemaining.toFixed(2)}% do Auto-Kill</span>
+            <span className={dailyLossGuardDate ? 'text-error font-bold' : 'text-tertiary font-bold'}>
+              {dailyLossGuardDate ? 'Limit dzienny osiągnięty' : `${ddRemaining.toFixed(2)}% do Auto-Pause`}
+            </span>
           </div>
         </div>
       </section>
@@ -609,10 +659,11 @@ export const DashboardView: React.FC = () => {
                           <td className="py-2.5 px-3 text-right">
                             <button
                               type="button"
-                              onClick={() => closePositionMarket(pos.id)}
-                              className="px-2.5 py-1 rounded bg-surface-container text-error hover:bg-error-container hover:text-on-error-container font-mono text-[10px] font-bold uppercase transition-colors whitespace-nowrap"
+                              disabled={Boolean(closingIds[pos.id])}
+                              onClick={() => void handleClosePosition(pos.id)}
+                              className="px-2.5 py-1 rounded bg-surface-container text-error hover:bg-error-container hover:text-on-error-container font-mono text-[10px] font-bold uppercase transition-colors whitespace-nowrap disabled:opacity-50"
                             >
-                              Zamknij Mkt
+                              {closingIds[pos.id] ? 'Zamykanie...' : 'Zamknij Mkt'}
                             </button>
                           </td>
                         </tr>
@@ -689,10 +740,11 @@ export const DashboardView: React.FC = () => {
                         </div>
                         <button
                           type="button"
-                          onClick={() => cancelPendingOrder(ord.id)}
-                          className="px-2.5 py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-mono text-[10px] uppercase transition-colors"
+                          disabled={Boolean(cancellingIds[ord.id])}
+                          onClick={() => void handleCancelOrder(ord.id)}
+                          className="px-2.5 py-1 rounded bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-mono text-[10px] uppercase transition-colors disabled:opacity-50"
                         >
-                          Anuluj
+                          {cancellingIds[ord.id] ? 'Anulowanie...' : 'Anuluj'}
                         </button>
                       </div>
                     </div>
@@ -756,7 +808,10 @@ export const DashboardView: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex-1 flex flex-col gap-1.5 overflow-y-auto max-h-[460px] pr-1 font-mono text-[11px]">
+            <div
+              ref={feedScrollRef}
+              className="flex-1 flex flex-col gap-1.5 overflow-y-auto max-h-[460px] pr-1 font-mono text-[11px]"
+            >
               {filteredEvents.map((ev) => (
                 <div
                   key={ev.id}

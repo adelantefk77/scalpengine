@@ -11,6 +11,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
+import { LosingPairsToggleButton } from '../components/LosingPairsToggleButton';
 import { useBot } from '../engine/botContext';
 import {
   ALL_SCANNER_ASSETS,
@@ -21,14 +22,28 @@ import {
 } from '../engine/types';
 
 export const StrategyView: React.FC = () => {
-  const { config, updateConfig, showToast } = useBot();
+  const { config, updateConfig, togglePausePair, showToast } = useBot();
   const [draft, setDraft] = useState<StrategyConfig>(config);
   const [syncAt, setSyncAt] = useState<string>(new Date().toLocaleTimeString('pl-PL'));
   const [hotReloadBanner, setHotReloadBanner] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [addPairOpen, setAddPairOpen] = useState(false);
 
+  const isDirty = useMemo(() => JSON.stringify(draft) !== JSON.stringify(config), [draft, config]);
+
+  // Only synchronize external server config when user has no unsaved local edits;
+  // always mirror server pausedPairs so 1-click pause/resume actions never desync the draft.
   useEffect(() => {
-    setDraft(config);
+    if (!isDirty) {
+      setDraft(config);
+    } else {
+      setDraft((prev) =>
+        JSON.stringify(prev.pausedPairs) === JSON.stringify(config.pausedPairs)
+          ? prev
+          : { ...prev, pausedPairs: config.pausedPairs }
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config]);
 
   const applyPreset = (presetId: PresetId) => {
@@ -36,21 +51,41 @@ export const StrategyView: React.FC = () => {
     setDraft((prev) => ({ ...prev, ...patch }));
   };
 
-  const handleHotReload = () => {
-    updateConfig(
-      draft,
-      `Hot-Reload: Z-Score ${draft.zScoreThreshold.toFixed(2)}σ | RSI(${draft.rsiLongMax}/${draft.rsiShortMin}) | ADX<${draft.adxMax} | ${draft.leverage}x`
-    );
-    setSyncAt(new Date().toLocaleTimeString('pl-PL'));
-    setHotReloadBanner(true);
-    showToast('Parametry strategii zaktualizowane i przeładowane w silniku.', 'success');
-    window.setTimeout(() => setHotReloadBanner(false), 4000);
+  const handleHotReload = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    try {
+      const ok = await updateConfig(
+        draft,
+        `Hot-Reload: Z-Score ${draft.zScoreThreshold.toFixed(2)}σ | RSI(${draft.rsiLongMax}/${draft.rsiShortMin}) | ADX<${draft.adxMax} | ${draft.leverage}x | DD<${draft.dailyMaxLossPct}%`
+      );
+      if (!ok) return;
+      setSyncAt(new Date().toLocaleTimeString('pl-PL'));
+      setHotReloadBanner(true);
+      showToast('Parametry strategii zaktualizowane i przeładowane w silniku.', 'success');
+      window.setTimeout(() => setHotReloadBanner(false), 4000);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
-  const handleReset = () => {
-    setDraft(DEFAULT_STRATEGY_CONFIG);
-    updateConfig(DEFAULT_STRATEGY_CONFIG, 'Przywrócono domyślne parametry strategii.');
-    showToast('Przywrócono domyślne parametry strategii.', 'success');
+  const handleDiscard = () => {
+    setDraft(config);
+    showToast('Odrzucono niezapisane zmiany w formularzu.', 'warning');
+  };
+
+  const handleReset = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
+    try {
+      const ok = await updateConfig(DEFAULT_STRATEGY_CONFIG, 'Przywrócono domyślne parametry strategii.');
+      if (!ok) return;
+      setDraft(DEFAULT_STRATEGY_CONFIG);
+      setSyncAt(new Date().toLocaleTimeString('pl-PL'));
+      showToast('Przywrócono domyślne parametry strategii.', 'success');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const removePair = (base: string) => {
@@ -126,28 +161,47 @@ export const StrategyView: React.FC = () => {
 
         <div className="flex flex-wrap items-center gap-3 justify-between xl:justify-end">
           <div className="flex flex-col text-right font-mono">
-            <span className="text-[10px] uppercase text-on-surface-variant">Konfiguracja Runtime</span>
+            <span className="text-[10px] uppercase text-on-surface-variant">
+              {isDirty ? 'Niezapisane zmiany robocze' : 'Konfiguracja Runtime'}
+            </span>
             <span className="text-xs text-on-surface tabular-nums">
-              Sync: <strong className="text-tertiary">{syncAt}</strong>
+              {isDirty ? (
+                <strong className="text-primary">Wymaga Hot-Reload</strong>
+              ) : (
+                <>
+                  Sync: <strong className="text-tertiary">{syncAt}</strong>
+                </>
+              )}
             </span>
           </div>
 
           <div className="flex items-center gap-2">
+            {isDirty && (
+              <button
+                type="button"
+                onClick={handleDiscard}
+                className="px-3 py-2 rounded-lg bg-surface-container-low hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+              >
+                Odrzuć zmiany
+              </button>
+            )}
             <button
               type="button"
-              onClick={handleReset}
-              className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-on-surface text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              disabled={isSaving}
+              onClick={() => void handleReset()}
+              className="px-3 py-2 rounded-lg bg-surface-container-high hover:bg-surface-container-highest text-on-surface text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>Resetuj domyślne</span>
             </button>
             <button
               type="button"
-              onClick={handleHotReload}
-              className="px-4 py-2 rounded-lg bg-primary-container text-on-primary-container hover:bg-primary font-display text-xs font-bold flex items-center gap-1.5 shadow-[0_0_14px_rgba(247,166,0,0.35)] transition-all whitespace-nowrap shrink-0"
+              disabled={isSaving}
+              onClick={() => void handleHotReload()}
+              className="px-4 py-2 rounded-lg bg-primary-container text-on-primary-container hover:bg-primary font-display text-xs font-bold flex items-center gap-1.5 shadow-[0_0_14px_rgba(247,166,0,0.35)] transition-all whitespace-nowrap shrink-0 disabled:opacity-50"
             >
               <Zap className="w-4 h-4" />
-              <span>Zapisz i Przeładuj (Hot Reload)</span>
+              <span>{isSaving ? 'Zapisywanie...' : 'Zapisz i Przeładuj (Hot Reload)'}</span>
             </button>
           </div>
         </div>
@@ -261,29 +315,65 @@ export const StrategyView: React.FC = () => {
             </div>
           </div>
 
+          {draft.marketType !== 'perp_usdt' && (
+            <div className="px-3 py-2 rounded-lg bg-primary-container/15 border border-primary/30 text-[11px] text-primary leading-snug">
+              Dla konta <strong>Bybit REAL Mainnet</strong> rekomendowanym i w pełni przetestowanym standardem jest{' '}
+              <strong>Perpetual Futures (USDT)</strong> (najwyższa płynność i pełna obsługa TP/SL oraz Closed PnL).
+            </div>
+          )}
+
           {/* Active Pairs Multi-Selector */}
-          <div className="flex flex-col gap-1.5 relative">
-            <div className="flex items-center justify-between font-mono text-[10px] uppercase text-on-surface-variant">
-              <span>Aktywne Pary (Scanner Pool)</span>
-              <span className="tabular-nums">{draft.activePairs.length}/16 par</span>
+          <div className="flex flex-col gap-2 relative">
+            <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[10px] uppercase text-on-surface-variant">
+              <span>
+                Aktywne Pary (Scanner Pool) ·{' '}
+                <strong className="text-on-surface tabular-nums">
+                  {draft.activePairs.length}/{ALL_SCANNER_ASSETS.length}
+                </strong>
+                {config.pausedPairs.length > 0 && (
+                  <span className="text-error ml-1.5">({config.pausedPairs.length} pauza)</span>
+                )}
+              </span>
+              <LosingPairsToggleButton size="xs" />
             </div>
             <div className="flex flex-wrap gap-1.5 p-2.5 rounded-lg bg-surface-container-lowest min-h-[76px] items-center content-start">
-              {draft.activePairs.map((base) => (
-                <span
-                  key={base}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded bg-surface-container-high text-on-surface font-mono text-[11px]"
-                >
-                  <span>{base}/{draft.marketType === 'perp_usdt' ? 'USDT' : draft.quoteCurrency}</span>
-                  <button
-                    type="button"
-                    onClick={() => removePair(base)}
-                    className="text-on-surface-variant hover:text-error"
-                    aria-label={`Usuń ${base}`}
+              {draft.activePairs.map((base) => {
+                const isPaused = config.pausedPairs.includes(base);
+                return (
+                  <span
+                    key={base}
+                    className={`inline-flex items-center gap-1 px-2 py-1 rounded font-mono text-[11px] border ${
+                      isPaused
+                        ? 'bg-surface-container text-on-surface-variant border-primary/30'
+                        : 'bg-surface-container-high text-on-surface border-transparent'
+                    }`}
                   >
-                    <X className="w-3 h-3" />
-                  </button>
-                </span>
-              ))}
+                    <button
+                      type="button"
+                      onClick={() => void togglePausePair(base)}
+                      title={
+                        isPaused
+                          ? `Para ${base} wstrzymana — kliknij aby wznowić`
+                          : `Kliknij aby wstrzymać parę ${base}`
+                      }
+                      className={isPaused ? 'line-through hover:text-tertiary' : 'hover:text-primary'}
+                    >
+                      {base}/{draft.marketType === 'perp_usdt' ? 'USDT' : draft.quoteCurrency}
+                    </button>
+                    {isPaused && (
+                      <span className="text-[9px] font-bold text-primary uppercase">PAUZA</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => removePair(base)}
+                      className="text-on-surface-variant hover:text-error"
+                      aria-label={`Usuń ${base}`}
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                );
+              })}
               {availableToAdd.length > 0 && (
                 <button
                   type="button"
@@ -551,7 +641,7 @@ export const StrategyView: React.FC = () => {
             </span>
           </div>
 
-          <div className="flex flex-col gap-1.5">
+          <div className="flex flex-col gap-2">
             <span className="font-mono text-[10px] uppercase text-on-surface-variant">Rozmiar Pojedynczej Pozycji</span>
             <div className="grid grid-cols-2 gap-1.5 bg-surface-container-low p-1 rounded-lg">
               <button
@@ -563,7 +653,7 @@ export const StrategyView: React.FC = () => {
                     : 'text-on-surface-variant hover:text-on-surface'
                 }`}
               >
-                % Kapitału: {draft.positionPercent}%
+                % Kapitału
               </button>
               <button
                 type="button"
@@ -574,9 +664,52 @@ export const StrategyView: React.FC = () => {
                     : 'text-on-surface-variant hover:text-on-surface'
                 }`}
               >
-                Stała: ${draft.positionFixedUsd}
+                Stała kwota ($)
               </button>
             </div>
+            {draft.sizingMode === 'percent' ? (
+              <div className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-surface-container-low">
+                <span className="text-xs text-on-surface-variant">Depozyt / pozycję (1–35%):</span>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min="1"
+                    max="35"
+                    step="0.5"
+                    value={draft.positionPercent}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        positionPercent: Math.min(35, Math.max(1, Number(e.target.value) || 1)),
+                      }))
+                    }
+                    className="w-16 bg-surface-container-highest rounded px-1.5 py-0.5 text-right font-mono text-xs text-primary font-bold outline-none tabular-nums"
+                  />
+                  <span className="font-mono text-xs text-on-surface-variant">%</span>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-surface-container-low">
+                <span className="text-xs text-on-surface-variant">Wartość notional ($):</span>
+                <div className="flex items-center gap-1">
+                  <span className="font-mono text-xs text-on-surface-variant">$</span>
+                  <input
+                    type="number"
+                    min="10"
+                    max="100000"
+                    step="50"
+                    value={draft.positionFixedUsd}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        positionFixedUsd: Math.min(100000, Math.max(10, Number(e.target.value) || 100)),
+                      }))
+                    }
+                    className="w-20 bg-surface-container-highest rounded px-1.5 py-0.5 text-right font-mono text-xs text-primary font-bold outline-none tabular-nums"
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="flex flex-col gap-2 p-3 rounded-lg bg-surface-container-low">
@@ -621,8 +754,27 @@ export const StrategyView: React.FC = () => {
                   onChange={() => setDraft((prev) => ({ ...prev, tpMode: 'atr' }))}
                   className="accent-tertiary"
                 />
-                <span>Sztywny {draft.tpAtrMult}x ATR</span>
+                <span>Sztywny ATR</span>
               </label>
+              {draft.tpMode === 'atr' && (
+                <div className="flex items-center justify-between mt-0.5">
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="6.0"
+                    value={draft.tpAtrMult}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        tpAtrMult: Math.min(6, Math.max(0.5, Number(e.target.value) || 1.4)),
+                      }))
+                    }
+                    className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-tertiary font-bold outline-none tabular-nums"
+                  />
+                  <span className="font-mono text-[11px] text-on-surface-variant">x ATR</span>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col justify-between p-2.5 rounded-lg bg-surface-container-low">
@@ -632,9 +784,14 @@ export const StrategyView: React.FC = () => {
                   type="number"
                   step="0.1"
                   min="0.8"
-                  max="4.0"
+                  max="5.0"
                   value={draft.slAtrMult}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, slAtrMult: Number(e.target.value) || 1.8 }))}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      slAtrMult: Math.min(5, Math.max(0.8, Number(e.target.value) || 1.8)),
+                    }))
+                  }
                   className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-error font-bold outline-none tabular-nums"
                 />
                 <span className="font-mono text-xs text-on-surface-variant">x ATR</span>
@@ -650,9 +807,14 @@ export const StrategyView: React.FC = () => {
                 <input
                   type="number"
                   min="3"
-                  max="60"
+                  max="120"
                   value={draft.timeStopMinutes}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, timeStopMinutes: Number(e.target.value) || 12 }))}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      timeStopMinutes: Math.min(120, Math.max(3, Number(e.target.value) || 12)),
+                    }))
+                  }
                   className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-on-surface font-bold outline-none tabular-nums"
                 />
                 <span className="text-xs text-on-surface-variant">minut</span>
@@ -664,10 +826,13 @@ export const StrategyView: React.FC = () => {
                 <input
                   type="number"
                   min="1"
-                  max="8"
+                  max="10"
                   value={draft.maxConcurrentPositions}
                   onChange={(e) =>
-                    setDraft((prev) => ({ ...prev, maxConcurrentPositions: Number(e.target.value) || 3 }))
+                    setDraft((prev) => ({
+                      ...prev,
+                      maxConcurrentPositions: Math.min(10, Math.max(1, Number(e.target.value) || 3)),
+                    }))
                   }
                   className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-center font-mono text-xs text-on-surface font-bold outline-none tabular-nums"
                 />
@@ -676,19 +841,65 @@ export const StrategyView: React.FC = () => {
             </div>
           </div>
 
-          <div className="flex flex-col gap-1.5 p-3 rounded-lg bg-error-container/20 border border-error/20">
+          <div className="flex flex-col gap-2 p-3 rounded-lg bg-error-container/20 border border-error/20">
             <span className="font-display text-xs font-bold text-on-error-container">
               Globalne Bezpieczniki Awaryjne
             </span>
-            <div className="flex items-center justify-between text-xs text-on-surface">
-              <span>Daily Max Loss:</span>
-              <span className="font-mono font-bold text-error tabular-nums">{draft.dailyMaxLossPct.toFixed(1)}%</span>
+            <div className="flex items-center justify-between text-xs text-on-surface gap-2">
+              <span>Daily Max Loss (0.5–25%):</span>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  max="25"
+                  value={draft.dailyMaxLossPct}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      dailyMaxLossPct: Math.min(25, Math.max(0.5, Number(e.target.value) || 3)),
+                    }))
+                  }
+                  className="w-14 bg-surface-container-highest rounded px-1.5 py-0.5 text-right font-mono text-xs text-error font-bold outline-none tabular-nums"
+                />
+                <span className="font-mono text-xs text-error font-bold">%</span>
+              </div>
             </div>
-            <div className="flex items-center justify-between text-xs text-on-surface">
-              <span>Cooldown po stratach z rzędu:</span>
-              <span className="font-mono font-bold text-error tabular-nums">
-                {draft.maxConsecutiveLosses} serie → {draft.cooldownMinutes}m
-              </span>
+            <div className="flex items-center justify-between text-xs text-on-surface gap-2">
+              <span>Seria strat → Cooldown:</span>
+              <div className="flex items-center gap-1.5 font-mono text-xs">
+                <input
+                  type="number"
+                  min="1"
+                  max="15"
+                  value={draft.maxConsecutiveLosses}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      maxConsecutiveLosses: Math.min(15, Math.max(1, Number(e.target.value) || 3)),
+                    }))
+                  }
+                  className="w-11 bg-surface-container-highest rounded px-1 py-0.5 text-center text-error font-bold outline-none tabular-nums"
+                  title="Liczba strat z rzędu"
+                />
+                <span className="text-on-surface-variant">→</span>
+                <input
+                  type="number"
+                  min="5"
+                  max="720"
+                  step="5"
+                  value={draft.cooldownMinutes}
+                  onChange={(e) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      cooldownMinutes: Math.min(720, Math.max(5, Number(e.target.value) || 60)),
+                    }))
+                  }
+                  className="w-14 bg-surface-container-highest rounded px-1 py-0.5 text-center text-error font-bold outline-none tabular-nums"
+                  title="Czas pauzy w minutach"
+                />
+                <span className="text-on-surface-variant">m</span>
+              </div>
             </div>
           </div>
         </div>

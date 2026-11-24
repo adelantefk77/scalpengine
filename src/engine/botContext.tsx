@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { apiFetch } from './apiClient';
 import { buildIndicatorSeries, evaluatePointSignal, parseBybitKlines } from './indicators';
 import {
   ALL_SCANNER_ASSETS,
@@ -55,8 +56,10 @@ interface DaemonSnapshotResponse {
   marketError?: string | null;
   networkDiagnostics?: NetworkDiagnostics;
   botState: BotRunState;
+  dailyLossGuardDate?: string | null;
   executionMode: ExecutionMode;
   config: StrategyConfig;
+  walletBalance?: number;
   equity: number;
   startingEquity: number;
   availableBalance: number;
@@ -76,8 +79,9 @@ interface BotContextValue {
   activeRoute: NavRoute;
   setActiveRoute: (route: NavRoute) => void;
   config: StrategyConfig;
-  updateConfig: (next: StrategyConfig, logMessage?: string) => void;
+  updateConfig: (next: StrategyConfig, logMessage?: string) => Promise<boolean>;
   botState: BotRunState;
+  dailyLossGuardDate: string | null;
   executionMode: ExecutionMode;
   setExecutionMode: (mode: ExecutionMode, env?: PrivateEnv, confirmLive?: boolean) => Promise<boolean>;
   testBybitAccount: (env: PrivateEnv) => Promise<{
@@ -95,9 +99,10 @@ interface BotContextValue {
   serverMarketError: string | null;
   networkDiagnostics: NetworkDiagnostics | null;
   refreshPrivateAccount: () => Promise<boolean>;
-  togglePauseBot: () => void;
-  resumeFromKillSwitch: () => void;
-  triggerKillSwitch: () => void;
+  togglePauseBot: () => Promise<boolean>;
+  resumeFromKillSwitch: () => Promise<boolean>;
+  triggerKillSwitch: () => Promise<boolean>;
+  walletBalance: number;
   equity: number;
   startingEquity: number;
   availableBalance: number;
@@ -116,11 +121,13 @@ interface BotContextValue {
   isLoadingMarket: boolean;
   marketError: string | null;
   refreshMarketData: () => Promise<void>;
-  forceMakerOrder: (base: string, side: 'LONG' | 'SHORT') => void;
-  closePositionMarket: (positionId: string) => void;
-  cancelPendingOrder: (orderId: string) => void;
-  togglePausePair: (base: string) => void;
-  resetPaperAccount: () => void;
+  forceMakerOrder: (base: string, side: 'LONG' | 'SHORT') => Promise<boolean>;
+  closePositionMarket: (positionId: string) => Promise<boolean>;
+  cancelPendingOrder: (orderId: string) => Promise<boolean>;
+  togglePausePair: (base: string) => Promise<boolean>;
+  setPausedPairsBatch: (bases: string[], paused: boolean, reason?: string) => Promise<boolean>;
+  losingPairs: Array<{ base: string; netPnlUsd: number; trades: number }>;
+  resetPaperAccount: () => Promise<boolean>;
   toast: { message: string; type: 'success' | 'warning' | 'error' } | null;
   showToast: (message: string, type?: 'success' | 'warning' | 'error') => void;
 }
@@ -157,13 +164,15 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [serverMarketError, setServerMarketError] = useState<string | null>(null);
   const [networkDiagnostics, setNetworkDiagnostics] = useState<NetworkDiagnostics | null>(null);
 
-  const [equity, setEquity] = useState<number>(DEFAULT_START_EQUITY);
+  const [walletBalance, setWalletBalance] = useState<number>(DEFAULT_START_EQUITY);
+  const [serverEquity, setServerEquity] = useState<number>(DEFAULT_START_EQUITY);
   const [startingEquity, setStartingEquity] = useState<number>(DEFAULT_START_EQUITY);
   const [availableBalance, setAvailableBalance] = useState<number>(DEFAULT_START_EQUITY);
   const [todayRealizedPnl, setTodayRealizedPnl] = useState<number>(0);
   const [serverUnrealizedPnl, setServerUnrealizedPnl] = useState<number>(0);
   const [effectiveLeverage, setEffectiveLeverage] = useState<number>(0);
   const [drawdownPct, setDrawdownPct] = useState<number>(0);
+  const [dailyLossGuardDate, setDailyLossGuardDate] = useState<string | null>(null);
 
   const [closedTrades, setClosedTrades] = useState<ClosedTrade[]>([]);
   const [rawActivePositions, setRawActivePositions] = useState<ActivePosition[]>([]);
@@ -197,6 +206,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const configRef = useRef(config);
   configRef.current = config;
+  const lastConfigJsonRef = useRef(JSON.stringify(DEFAULT_STRATEGY_CONFIG));
 
   const applyDaemonSnapshot = useCallback((data: DaemonSnapshotResponse) => {
     if (!data || !data.config) return;
@@ -205,9 +215,19 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (data.marketError !== undefined) setServerMarketError(data.marketError);
     if (data.networkDiagnostics) setNetworkDiagnostics(data.networkDiagnostics);
     setBotState(data.botState);
+    setDailyLossGuardDate(data.dailyLossGuardDate ?? null);
     setExecutionModeState(data.executionMode);
-    setConfig(data.config);
-    setEquity(Number(data.equity || 0));
+
+    // Keep config state reference stable when server config hasn't changed (prevents UI form resets & unnecessary re-renders)
+    const nextConfigJson = JSON.stringify(data.config);
+    if (nextConfigJson !== lastConfigJsonRef.current) {
+      lastConfigJsonRef.current = nextConfigJson;
+      setConfig(data.config);
+    }
+
+    const eq = Number(data.equity || 0);
+    setServerEquity(eq);
+    setWalletBalance(Number(data.walletBalance ?? eq));
     setStartingEquity(Number(data.startingEquity || DEFAULT_START_EQUITY));
     setAvailableBalance(Number(data.availableBalance || 0));
     setTodayRealizedPnl(Number(data.todayRealizedPnl || 0));
@@ -224,11 +244,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const syncDaemonState = useCallback(async () => {
     try {
-      const res = await fetch('/api/bot/state', { credentials: 'include' });
-      if (res.status === 401) {
-        window.dispatchEvent(new CustomEvent('scalpengine:unauthorized'));
-        return;
-      }
+      const res = await apiFetch('/api/bot/state');
       if (!res.ok) return;
       const json = (await res.json()) as DaemonSnapshotResponse;
       if (json.ok) {
@@ -257,7 +273,10 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const fetchPublicMarketJson = async (apiEndpoint: string, directPath: string) => {
       try {
-        const res = await fetch(apiEndpoint);
+        const res = await apiFetch(apiEndpoint);
+        if (res.status === 401) {
+          throw new Error('Wymagane ponowne zalogowanie (sesja wygasła).');
+        }
         const json = await res.json();
         if (res.ok && json.retCode === 0) {
           return { json, usedBrowserFallback: false, serverError: null as string | null };
@@ -409,9 +428,9 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const { symbol } = formatBybitSymbol(base, config.marketType, config.quoteCurrency);
           return `tickers.${symbol}`;
         });
-        ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(0, 10) }));
-        if (topics.length > 10) {
-          ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(10) }));
+        // Bybit v5 WS limits subscribe frames to 10 args per message
+        for (let i = 0; i < topics.length; i += 10) {
+          ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(i, i + 10) }));
         }
 
         pingSentAt = performance.now();
@@ -527,7 +546,8 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         pos.side === 'LONG'
           ? (markPrice - pos.entryPrice) * pos.qty
           : (pos.entryPrice - markPrice) * pos.qty;
-      const uPnlUsd = grossU - pos.entryFeeUsd;
+      // On Bybit exchange mode, unrealisedPnl does NOT subtract entryFeeUsd (already deducted from wallet on fill)
+      const uPnlUsd = executionMode === 'exchange' ? grossU : grossU - pos.entryFeeUsd;
       const uPnlPct = pos.notionalUsd > 0 ? (uPnlUsd / pos.notionalUsd) * 100 : 0;
       return {
         ...pos,
@@ -536,12 +556,18 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         unrealizedPnlPct: uPnlPct,
       };
     });
-  }, [rawActivePositions, tickersBySymbol]);
+  }, [rawActivePositions, tickersBySymbol, executionMode]);
 
   const unrealizedPnl = useMemo(() => {
     if (activePositions.length === 0) return serverUnrealizedPnl;
     return activePositions.reduce((acc, p) => acc + p.unrealizedPnlUsd, 0);
   }, [activePositions, serverUnrealizedPnl]);
+
+  // Consistent Total Equity (never double-counts uPnL in Exchange or Paper mode; smoothly tracks WS deltas)
+  const equity = useMemo(() => {
+    if (activePositions.length === 0) return serverEquity;
+    return serverEquity + (unrealizedPnl - serverUnrealizedPnl);
+  }, [activePositions.length, serverEquity, unrealizedPnl, serverUnrealizedPnl]);
 
   // Compute live pair telemetries for Scanner & Dashboard charts
   const pairTelemetries = useMemo<PairTelemetry[]>(() => {
@@ -615,23 +641,23 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // =========================================================================
 
   const updateConfig = useCallback(
-    (next: StrategyConfig, logMessage?: string) => {
-      setConfig(next);
-      void (async () => {
-        try {
-          const res = await fetch('/api/bot/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ config: next, logMessage }),
-          });
-          const data = (await res.json()) as DaemonSnapshotResponse;
-          if (res.ok && data.ok) {
-            applyDaemonSnapshot(data);
-          }
-        } catch {
-          showToast('Nie udało się zapisać konfiguracji na serwerze.', 'error');
+    async (next: StrategyConfig, logMessage?: string): Promise<boolean> => {
+      try {
+        const res = await apiFetch('/api/bot/config', {
+          method: 'POST',
+          body: JSON.stringify({ config: next, logMessage }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse;
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Serwer odrzucił konfigurację strategii.', 'error');
+          return false;
         }
-      })();
+        return true;
+      } catch {
+        showToast('Nie udało się zapisać konfiguracji na serwerze.', 'error');
+        return false;
+      }
     },
     [applyDaemonSnapshot, showToast]
   );
@@ -639,14 +665,12 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const setExecutionMode = useCallback(
     async (mode: ExecutionMode, env?: PrivateEnv, confirmLive = false): Promise<boolean> => {
       try {
-        const res = await fetch('/api/bot/mode', {
+        const res = await apiFetch('/api/bot/mode', {
           method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ mode, env, confirmLive }),
         });
         const data = (await res.json()) as DaemonSnapshotResponse;
-        applyDaemonSnapshot(data);
+        if (data.config) applyDaemonSnapshot(data);
         if (!res.ok || !data.ok) {
           showToast(
             data.error ||
@@ -677,9 +701,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const testBybitAccount = useCallback(async (env: PrivateEnv) => {
     try {
-      const res = await fetch(`/api/bybit/private/account?env=${encodeURIComponent(env)}`, {
-        credentials: 'include',
-      });
+      const res = await apiFetch(`/api/bybit/private/account?env=${encodeURIComponent(env)}`);
       const data = (await res.json()) as {
         ok?: boolean;
         env?: PrivateEnv;
@@ -707,185 +729,248 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const refreshPrivateAccount = useCallback(async () => {
     try {
-      const res = await fetch('/api/bot/control', {
+      const res = await apiFetch('/api/bot/control', {
         method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'refresh_private' }),
       });
       const data = (await res.json()) as DaemonSnapshotResponse;
-      applyDaemonSnapshot(data);
-      return Boolean(data.ok);
+      if (data.config) applyDaemonSnapshot(data);
+      return Boolean(res.ok && data.ok);
     } catch {
       return false;
     }
   }, [applyDaemonSnapshot]);
 
-  const togglePauseBot = useCallback(() => {
-    void (async () => {
-      try {
-        const res = await fetch('/api/bot/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'toggle_pause' }),
-        });
-        const data = (await res.json()) as DaemonSnapshotResponse;
-        if (data.config) applyDaemonSnapshot(data);
-        showToast(
-          data.botState === 'PAUSED' ? 'Bot wstrzymany (PAUSED).' : 'Bot uruchomiony (RUNNING).',
-          data.botState === 'PAUSED' ? 'warning' : 'success'
-        );
-      } catch {
-        showToast('Błąd komunikacji z serwerem.', 'error');
+  const togglePauseBot = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await apiFetch('/api/bot/control', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'toggle_pause' }),
+      });
+      const data = (await res.json()) as DaemonSnapshotResponse;
+      if (data.config) applyDaemonSnapshot(data);
+      if (!res.ok || !data.ok) {
+        showToast(data.error || 'Nie udało się zmienić stanu bota.', 'error');
+        return false;
       }
-    })();
+      showToast(
+        data.botState === 'PAUSED' ? 'Bot wstrzymany (PAUSED).' : 'Bot uruchomiony (RUNNING).',
+        data.botState === 'PAUSED' ? 'warning' : 'success'
+      );
+      return true;
+    } catch {
+      showToast('Błąd komunikacji z serwerem.', 'error');
+      return false;
+    }
   }, [applyDaemonSnapshot, showToast]);
 
-  const resumeFromKillSwitch = useCallback(() => {
-    void (async () => {
-      try {
-        const res = await fetch('/api/bot/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'resume_kill_switch' }),
-        });
-        const data = (await res.json()) as DaemonSnapshotResponse;
-        if (data.config) applyDaemonSnapshot(data);
-        showToast('Kill Switch odblokowany — bot 24/7 RUNNING.', 'success');
-      } catch {
-        showToast('Błąd komunikacji z serwerem.', 'error');
+  const resumeFromKillSwitch = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await apiFetch('/api/bot/control', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'resume_kill_switch' }),
+      });
+      const data = (await res.json()) as DaemonSnapshotResponse;
+      if (data.config) applyDaemonSnapshot(data);
+      if (!res.ok || !data.ok) {
+        showToast(data.error || 'Nie udało się odblokować Kill Switch.', 'error');
+        return false;
       }
-    })();
+      showToast('Kill Switch odblokowany — bot 24/7 RUNNING.', 'success');
+      return true;
+    } catch {
+      showToast('Błąd komunikacji z serwerem.', 'error');
+      return false;
+    }
   }, [applyDaemonSnapshot, showToast]);
 
-  const triggerKillSwitch = useCallback(() => {
-    void (async () => {
-      try {
-        const res = await fetch('/api/bot/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'kill_switch' }),
-        });
-        const data = (await res.json()) as DaemonSnapshotResponse;
-        if (data.config) applyDaemonSnapshot(data);
-        showToast(
-          data.message || 'KILL SWITCH AKTYWOWANY: Zlecenia anulowane, pozycje zamknięte.',
-          'error'
-        );
-      } catch {
-        showToast('Błąd sieci przy aktywacji Kill Switch.', 'error');
+  const triggerKillSwitch = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await apiFetch('/api/bot/control', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'kill_switch' }),
+      });
+      const data = (await res.json()) as DaemonSnapshotResponse;
+      if (data.config) applyDaemonSnapshot(data);
+      if (!res.ok || !data.ok) {
+        showToast(data.error || data.message || 'Błąd aktywacji Kill Switch!', 'error');
+        return false;
       }
-    })();
+      showToast(
+        data.message || 'KILL SWITCH AKTYWOWANY: Zlecenia anulowane, pozycje zamknięte.',
+        'error'
+      );
+      return true;
+    } catch {
+      showToast('Błąd sieci przy aktywacji Kill Switch.', 'error');
+      return false;
+    }
   }, [applyDaemonSnapshot, showToast]);
 
-  const resetPaperAccount = useCallback(() => {
-    void (async () => {
-      try {
-        const res = await fetch('/api/bot/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'reset_paper' }),
-        });
-        const data = (await res.json()) as DaemonSnapshotResponse;
-        if (data.config) applyDaemonSnapshot(data);
-        showToast('Konto symulacyjne zresetowane do $25,000.00.', 'success');
-      } catch {
-        showToast('Błąd resetu konta.', 'error');
+  const resetPaperAccount = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await apiFetch('/api/bot/control', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'reset_paper' }),
+      });
+      const data = (await res.json()) as DaemonSnapshotResponse;
+      if (data.config) applyDaemonSnapshot(data);
+      if (!res.ok || !data.ok) {
+        showToast(data.error || 'Nie udało się zresetować konta Paper.', 'error');
+        return false;
       }
-    })();
+      showToast('Konto symulacyjne zresetowane do $25,000.00.', 'success');
+      return true;
+    } catch {
+      showToast('Błąd resetu konta.', 'error');
+      return false;
+    }
   }, [applyDaemonSnapshot, showToast]);
 
   const togglePausePair = useCallback(
-    (base: string) => {
-      void (async () => {
-        try {
-          const res = await fetch('/api/bot/control', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'toggle_pair', base }),
-          });
-          const data = (await res.json()) as DaemonSnapshotResponse & { paused?: boolean };
-          if (data.config) applyDaemonSnapshot(data);
-          showToast(
-            data.paused ? `Wstrzymano parę ${base} w skanerze 24/7.` : `Wznowiono skanowanie pary ${base}.`,
-            'success'
-          );
-        } catch {
-          showToast('Błąd komunikacji z serwerem.', 'error');
+    async (base: string): Promise<boolean> => {
+      try {
+        const res = await apiFetch('/api/bot/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'toggle_pair', base }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse & { paused?: boolean };
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Nie udało się zmienić statusu pary.', 'error');
+          return false;
         }
-      })();
+        showToast(
+          data.paused ? `Wstrzymano parę ${base} w skanerze 24/7.` : `Wznowiono skanowanie pary ${base}.`,
+          'success'
+        );
+        return true;
+      } catch {
+        showToast('Błąd komunikacji z serwerem.', 'error');
+        return false;
+      }
     },
     [applyDaemonSnapshot, showToast]
   );
 
-  const forceMakerOrder = useCallback(
-    (base: string, side: 'LONG' | 'SHORT') => {
-      void (async () => {
-        try {
-          const res = await fetch('/api/bot/order', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ base, side }),
-          });
-          const data = (await res.json()) as DaemonSnapshotResponse;
-          if (data.config) applyDaemonSnapshot(data);
-          if (!res.ok || !data.ok) {
-            showToast(data.error || 'Odrzucono zlecenie.', 'error');
-            return;
-          }
-          showToast(`Wysłano zlecenie Post-Only ${side} dla ${base}.`, 'success');
-        } catch (err) {
-          showToast(`Błąd zlecenia: ${err instanceof Error ? err.message : 'Network error'}`, 'error');
+  const setPausedPairsBatch = useCallback(
+    async (bases: string[], paused: boolean, reason?: string): Promise<boolean> => {
+      if (bases.length === 0) return false;
+      try {
+        const res = await apiFetch('/api/bot/control', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'set_paused_pairs', bases, paused, reason }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse & { changed?: string[] };
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Nie udało się zmienić statusu par.', 'error');
+          return false;
         }
-      })();
+        const changed = Array.isArray(data.changed) ? data.changed : [];
+        if (changed.length > 0) {
+          showToast(
+            paused
+              ? `Wyłączono ${changed.length} tracących par: ${changed.join(', ')}.`
+              : `Włączono ponownie ${changed.length} par: ${changed.join(', ')}.`,
+            'success'
+          );
+        } else {
+          showToast(
+            paused ? 'Wszystkie wybrane pary są już wstrzymane.' : 'Wszystkie wybrane pary są już aktywne.',
+            'warning'
+          );
+        }
+        return true;
+      } catch {
+        showToast('Błąd komunikacji z serwerem.', 'error');
+        return false;
+      }
+    },
+    [applyDaemonSnapshot, showToast]
+  );
+
+  const losingPairs = useMemo(() => {
+    const activeSet = new Set(config.activePairs);
+    const byBase = new Map<string, { base: string; netPnlUsd: number; trades: number }>();
+    for (const t of closedTrades) {
+      const base = (t.base || t.symbol.replace(/(USDT|USDC|PERP)$/, '')).toUpperCase();
+      if (!activeSet.has(base)) continue;
+      const cur = byBase.get(base) || { base, netPnlUsd: 0, trades: 0 };
+      cur.netPnlUsd += t.netPnlUsd;
+      cur.trades += 1;
+      byBase.set(base, cur);
+    }
+    return Array.from(byBase.values())
+      .filter((entry) => entry.netPnlUsd < -0.004)
+      .sort((a, b) => a.netPnlUsd - b.netPnlUsd);
+  }, [closedTrades, config.activePairs]);
+
+  const forceMakerOrder = useCallback(
+    async (base: string, side: 'LONG' | 'SHORT'): Promise<boolean> => {
+      try {
+        const res = await apiFetch('/api/bot/order', {
+          method: 'POST',
+          body: JSON.stringify({ base, side }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse;
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Odrzucono zlecenie.', 'error');
+          return false;
+        }
+        showToast(`Wysłano zlecenie Post-Only ${side} dla ${base}.`, 'success');
+        return true;
+      } catch (err) {
+        showToast(`Błąd zlecenia: ${err instanceof Error ? err.message : 'Network error'}`, 'error');
+        return false;
+      }
     },
     [applyDaemonSnapshot, showToast]
   );
 
   const cancelPendingOrder = useCallback(
-    (orderId: string) => {
-      void (async () => {
-        try {
-          const res = await fetch('/api/bot/cancel-order', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ orderId }),
-          });
-          const data = (await res.json()) as DaemonSnapshotResponse;
-          if (data.config) applyDaemonSnapshot(data);
-          if (!res.ok || !data.ok) {
-            showToast(data.error || 'Nie udało się anulować zlecenia.', 'error');
-            return;
-          }
-          showToast('Anulowano oczekujące zlecenie.', 'success');
-        } catch {
-          showToast('Błąd anulowania zlecenia.', 'error');
+    async (orderId: string): Promise<boolean> => {
+      try {
+        const res = await apiFetch('/api/bot/cancel-order', {
+          method: 'POST',
+          body: JSON.stringify({ orderId }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse;
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Nie udało się anulować zlecenia.', 'error');
+          return false;
         }
-      })();
+        showToast('Anulowano oczekujące zlecenie.', 'success');
+        return true;
+      } catch {
+        showToast('Błąd anulowania zlecenia.', 'error');
+        return false;
+      }
     },
     [applyDaemonSnapshot, showToast]
   );
 
   const closePositionMarket = useCallback(
-    (positionId: string) => {
-      void (async () => {
-        try {
-          const res = await fetch('/api/bot/close-position', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ positionId }),
-          });
-          const data = (await res.json()) as DaemonSnapshotResponse;
-          if (data.config) applyDaemonSnapshot(data);
-          if (!res.ok || !data.ok) {
-            showToast(data.error || 'Nie udało się zamknąć pozycji.', 'error');
-            return;
-          }
-          showToast('Zamknięto pozycję po cenie rynkowej.', 'warning');
-        } catch {
-          showToast('Błąd zamykania pozycji.', 'error');
+    async (positionId: string): Promise<boolean> => {
+      try {
+        const res = await apiFetch('/api/bot/close-position', {
+          method: 'POST',
+          body: JSON.stringify({ positionId }),
+        });
+        const data = (await res.json()) as DaemonSnapshotResponse;
+        if (data.config) applyDaemonSnapshot(data);
+        if (!res.ok || !data.ok) {
+          showToast(data.error || 'Nie udało się zamknąć pozycji.', 'error');
+          return false;
         }
-      })();
+        showToast('Zamknięto pozycję po cenie rynkowej.', 'warning');
+        return true;
+      } catch {
+        showToast('Błąd zamykania pozycji.', 'error');
+        return false;
+      }
     },
     [applyDaemonSnapshot, showToast]
   );
@@ -896,6 +981,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     config,
     updateConfig,
     botState,
+    dailyLossGuardDate,
     executionMode,
     setExecutionMode,
     testBybitAccount,
@@ -909,6 +995,7 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     togglePauseBot,
     resumeFromKillSwitch,
     triggerKillSwitch,
+    walletBalance,
     equity,
     startingEquity,
     availableBalance,
@@ -931,6 +1018,8 @@ export const BotProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     closePositionMarket,
     cancelPendingOrder,
     togglePausePair,
+    setPausedPairsBatch,
+    losingPairs,
     resetPaperAccount,
     toast,
     showToast,

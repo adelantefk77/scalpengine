@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { Eye, EyeOff, Lock, ShieldCheck } from 'lucide-react';
+import { apiFetch } from '../engine/apiClient';
 
 interface AuthContextValue {
   authEnabled: boolean;
@@ -40,7 +41,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
   const checkStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/auth/status', { credentials: 'include' });
+      const res = await apiFetch('/api/auth/status');
       const data = (await res.json()) as AuthStatusResponse;
       setAuthEnabled(Boolean(data.authEnabled));
       setAuthenticated(Boolean(data.authenticated));
@@ -90,10 +91,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
     setExpiredNotice(false);
 
     try {
-      const res = await fetch('/api/auth/login', {
+      const res = await apiFetch('/api/auth/login', {
         method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),
       });
       const data = (await res.json()) as AuthStatusResponse & { error?: string };
@@ -114,9 +113,8 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
   const logout = useCallback(async () => {
     try {
-      await fetch('/api/auth/logout', {
+      await apiFetch('/api/auth/logout', {
         method: 'POST',
-        credentials: 'include',
       });
     } finally {
       if (authEnabled) {

@@ -12,7 +12,25 @@ interface LoginAttemptRecord {
   lockedUntil: number;
 }
 
+const MAX_LOGIN_ATTEMPT_RECORDS = 2000;
+const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
+
 const loginAttempts = new Map<string, LoginAttemptRecord>();
+
+function pruneLoginAttempts(now: number) {
+  for (const [ip, rec] of loginAttempts.entries()) {
+    const expiredLock = rec.lockedUntil > 0 && rec.lockedUntil <= now;
+    const expiredWindow = rec.lockedUntil === 0 && now - rec.firstFailureAt >= LOCKOUT_MS;
+    if (expiredLock || expiredWindow) {
+      loginAttempts.delete(ip);
+    }
+  }
+  while (loginAttempts.size > MAX_LOGIN_ATTEMPT_RECORDS) {
+    const oldestKey = loginAttempts.keys().next().value;
+    if (!oldestKey) break;
+    loginAttempts.delete(oldestKey);
+  }
+}
 
 export function getConfiguredPassword(): string {
   return (
@@ -31,7 +49,7 @@ function getSigningKey(): Buffer {
   const secretSource = (
     process.env.AUTH_SECRET ||
     getConfiguredPassword() ||
-    'scalpengine-default-ephemeral-secret'
+    EPHEMERAL_FALLBACK_SECRET
   ).trim();
   return crypto.createHash('sha256').update(`scalpengine-auth-v1:${secretSource}`).digest();
 }
@@ -118,7 +136,11 @@ export function parseCookieHeader(cookieHeader: string | undefined, name: string
     if (idx === -1) continue;
     const key = pair.slice(0, idx).trim();
     if (key === name) {
-      return decodeURIComponent(pair.slice(idx + 1).trim());
+      try {
+        return decodeURIComponent(pair.slice(idx + 1).trim());
+      } catch {
+        return undefined;
+      }
     }
   }
   return undefined;
@@ -152,8 +174,63 @@ function formatSessionCookie(req: Request, value: string, maxAgeSec: number): st
   ];
   if (https) {
     parts.push('Secure');
+    parts.push('Partitioned');
   }
   return parts.join('; ');
+}
+
+export function securityHeadersMiddleware(_req: Request, res: Response, next: NextFunction) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  next();
+}
+
+export function requireCsrfProtection(req: Request, res: Response, next: NextFunction) {
+  const method = req.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+    next();
+    return;
+  }
+
+  // 1. Validate Origin header when present (blocks cross-origin browser requests)
+  const originHeader = req.headers.origin;
+  if (typeof originHeader === 'string' && originHeader.length > 0 && originHeader !== 'null') {
+    const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+      .split(',')[0]
+      .trim()
+      .toLowerCase();
+    try {
+      const originHost = new URL(originHeader).host.toLowerCase();
+      if (rawHost && originHost !== rawHost) {
+        res.status(403).json({
+          ok: false,
+          error: 'Odrzucono żądanie z niedozwolonego źródła (Origin mismatch).',
+        });
+        return;
+      }
+    } catch {
+      res.status(403).json({
+        ok: false,
+        error: 'Nieprawidłowy nagłówek Origin.',
+      });
+      return;
+    }
+  }
+
+  // 2. Require explicit application header on mutating API calls when session auth is enabled
+  if (isAuthEnabled()) {
+    const clientMarker = req.headers['x-scalpengine-client'] || req.headers['x-requested-with'];
+    if (!clientMarker) {
+      res.status(403).json({
+        ok: false,
+        error: 'Brak wymaganego nagłówka aplikacji dla operacji modyfikującej stan.',
+      });
+      return;
+    }
+  }
+
+  next();
 }
 
 export function getAuthStatusFromRequest(req: Request): {
@@ -214,6 +291,7 @@ export function handleLoginRequest(req: Request, res: Response) {
 
   const ip = getClientIp(req);
   const now = Date.now();
+  pruneLoginAttempts(now);
   const record = loginAttempts.get(ip);
 
   if (record && record.lockedUntil > now) {
